@@ -1,0 +1,53 @@
+name: Build HM GAMING FF + Patch IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build unsigned app
+        run: |
+          rm -rf build Payload HM-GAMING-FF-PATCH-unsigned.ipa
+
+          xcodebuild \
+            -project ThreeOneOSFive.xcodeproj \
+            -target 3105 \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+
+          APP_PATH=$(find build -maxdepth 1 -type d -name "*.app" | head -n 1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "Không tìm thấy file .app trong thư mục build"
+            ls -la build
+            exit 1
+          fi
+
+          echo "Đang đóng gói: $APP_PATH"
+          cp -R "$APP_PATH" Payload/
+
+          zip -qry "HM-GAMING-FF-PATCH-unsigned.ipa" Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: HM-GAMING-FF-PATCH-unsigned-ipa
+          path: HM-GAMING-FF-PATCH-unsigned.ipa
