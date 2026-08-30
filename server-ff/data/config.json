@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-30T00:00:00Z",
+  "games": {
+    "freefire": {
+      "name": "Free Fire",
+      "features": []
+    },
+    "freefiremax": {
+      "name": "Free Fire MAX",
+      "features": []
+    }
+  }
+}
