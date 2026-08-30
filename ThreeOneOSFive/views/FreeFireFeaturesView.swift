@@ -29,6 +29,27 @@ enum FFGameKind: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+enum FFFeatureCategory: String, CaseIterable, Identifiable, Codable {
+    case aim
+    case esp
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .aim: return "AIM"
+        case .esp: return "ESP"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .aim: return "scope"
+        case .esp: return "eye.fill"
+        }
+    }
+}
+
 struct FFRemoteResponse: Decodable {
     let version: Int?
     let games: [String: FFRemoteGame]
@@ -42,6 +63,7 @@ struct FFRemoteGame: Decodable {
 struct FFRemoteFeature: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
+    let category: String?
     let note: String?
     let enabled: Bool
     let destinationPath: String
@@ -51,7 +73,7 @@ struct FFRemoteFeature: Decodable, Identifiable, Hashable {
     let updatedAt: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, note, enabled
+        case id, name, category, note, enabled
         case destinationPath = "destination_path"
         case activeSHA256 = "active_sha256"
         case originalSHA256 = "original_sha256"
@@ -458,6 +480,7 @@ final class FreeFireFeatureViewModel: ObservableObject {
     private static let keyAccessInfoKey = "hmGaming.ffKeyAccessInfo.v1"
 
     @Published var selectedGame: FFGameKind = .freeFire
+    @Published var selectedCategory: FFFeatureCategory = .aim
     @Published private(set) var remoteGames: [String: FFRemoteGame] = [:]
     @Published private(set) var activeRecords: [FFActiveRecord] = []
     @Published private(set) var keyAccessInfo: [String: FFKeyAccessInfo] = [:]
@@ -476,7 +499,12 @@ final class FreeFireFeatureViewModel: ObservableObject {
 
     var visibleFeatures: [FFRemoteFeature] {
         let all = remoteGames[selectedGame.rawValue]?.features ?? []
-        return all.filter { $0.enabled || activeRecord(forFeatureID: $0.id, game: selectedGame) != nil }
+        return all.filter { feature in
+            let rawCategory = feature.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "aim"
+            let categoryMatches = rawCategory == selectedCategory.rawValue
+            let shouldShow = feature.enabled || activeRecord(forFeatureID: feature.id, game: selectedGame) != nil
+            return categoryMatches && shouldShow
+        }
     }
 
     var orphanedActiveRecords: [FFActiveRecord] {
@@ -891,6 +919,7 @@ struct FreeFireFeaturesView: View {
                     topHeader
                     heroBanner
                     gameSelector
+                    categorySelector
                     featureHeader
                     mainContent
                     statusCard
@@ -1022,6 +1051,7 @@ struct FreeFireFeaturesView: View {
         return Button {
             withAnimation(.easeInOut(duration: 0.18)) {
                 model.selectedGame = game
+                model.selectedCategory = .aim
             }
         } label: {
             HStack(spacing: 11) {
@@ -1059,6 +1089,38 @@ struct FreeFireFeaturesView: View {
             .shadow(color: selected ? accent.opacity(0.15) : .clear, radius: 12)
         }
         .buttonStyle(.plain)
+    }
+
+    private var categorySelector: some View {
+        HStack(spacing: 10) {
+            ForEach(FFFeatureCategory.allCases) { category in
+                let selected = model.selectedCategory == category
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        model.selectedCategory = category
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: category.icon)
+                            .font(.system(size: 14, weight: .bold))
+                        Text(category.title)
+                            .font(.system(size: 13.5, weight: .heavy, design: .rounded))
+                    }
+                    .foregroundStyle(selected ? Color.black : Color.white.opacity(0.68))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(selected ? accent : card)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(selected ? accent : cardBorder, lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 
     private var featureHeader: some View {
@@ -1158,7 +1220,7 @@ struct FreeFireFeaturesView: View {
             Text("Chưa có chức năng")
                 .font(.system(size: 16, weight: .bold))
                 .foregroundStyle(.white)
-            Text("Thêm chức năng trên trang Admin của server rồi bấm Làm mới.")
+            Text("Chưa có chức năng \(model.selectedCategory.title). Thêm trên Admin rồi bấm Làm mới.")
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(Color.white.opacity(0.50))
                 .multilineTextAlignment(.center)
