@@ -2,6 +2,12 @@ name: Build HM GAMING FF + Patch IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Build ID phải trùng với Build ID trong Admin'
+        required: true
+        default: 'HM-20260830-B001'
+        type: string
 
 jobs:
   build:
@@ -14,10 +20,21 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      - name: Set HM Build ID
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          if ! echo "$BUILD_ID" | grep -Eq '^[A-Za-z0-9._-]{3,64}$'; then
+            echo "Build ID không hợp lệ"
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c "Set :HMBuildID $BUILD_ID" ThreeOneOSFive/Info.plist
+          echo "Building HM GAMING with HMBuildID=$BUILD_ID"
+          /usr/libexec/PlistBuddy -c "Print :HMBuildID" ThreeOneOSFive/Info.plist
+
       - name: Build unsigned app
         run: |
           rm -rf build Payload HM-GAMING-FF-PATCH-unsigned.ipa
-
           xcodebuild \
             -project ThreeOneOSFive.xcodeproj \
             -target 3105 \
@@ -32,22 +49,18 @@ jobs:
       - name: Package IPA
         run: |
           mkdir -p Payload
-
           APP_PATH=$(find build -maxdepth 1 -type d -name "*.app" | head -n 1)
-
           if [ -z "$APP_PATH" ]; then
-            echo "Không tìm thấy file .app trong thư mục build"
+            echo "Không tìm thấy file .app"
             ls -la build
             exit 1
           fi
-
-          echo "Đang đóng gói: $APP_PATH"
+          echo "Packaging $APP_PATH"
           cp -R "$APP_PATH" Payload/
-
           zip -qry "HM-GAMING-FF-PATCH-unsigned.ipa" Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: HM-GAMING-FF-PATCH-unsigned-ipa
+          name: HM-GAMING-FF-PATCH-${{ inputs.build_id }}-unsigned-ipa
           path: HM-GAMING-FF-PATCH-unsigned.ipa
