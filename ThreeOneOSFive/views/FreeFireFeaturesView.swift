@@ -404,7 +404,8 @@ enum FFAccessClient {
             "action": "activate",
             "game": game.rawValue,
             "feature_id": feature.id,
-            "device_id": FFDeviceIdentity.value
+            "device_id": FFDeviceIdentity.value,
+            "build_id": HMBuildIdentity.id
         ]
         if let key, !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             body["key"] = key
@@ -421,6 +422,7 @@ enum FFAccessClient {
             "game": record.game.rawValue,
             "feature_id": record.featureID,
             "device_id": FFDeviceIdentity.value,
+            "build_id": HMBuildIdentity.id,
             "access_token": accessToken
         ])
     }
@@ -490,7 +492,16 @@ final class FreeFireFeatureViewModel: ObservableObject {
     }
 
     func reload() async {
-        guard let apiURL = validatedAPIURL(from: Self.serverAPIURL) else {
+        guard let baseURL = validatedAPIURL(from: Self.serverAPIURL),
+              var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            remoteGames = [:]
+            serverConfigurationError = FFFeatureError.invalidServerURL.localizedDescription
+            return
+        }
+        var items = components.queryItems ?? []
+        items.append(URLQueryItem(name: "build_id", value: HMBuildIdentity.id))
+        components.queryItems = items
+        guard let apiURL = components.url else {
             remoteGames = [:]
             serverConfigurationError = FFFeatureError.invalidServerURL.localizedDescription
             return
@@ -507,13 +518,20 @@ final class FreeFireFeatureViewModel: ObservableObject {
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else { throw FFFeatureError.invalidResponse }
-            guard (200...299).contains(http.statusCode) else { throw FFFeatureError.serverStatus(http.statusCode) }
+            guard (200...299).contains(http.statusCode) else {
+                if let payload = try? JSONDecoder().decode(FFServerErrorPayload.self, from: data) {
+                    throw FFServerAccessError(code: payload.code ?? "server_error", message: payload.message ?? "Máy chủ từ chối yêu cầu.")
+                }
+                throw FFFeatureError.serverStatus(http.statusCode)
+            }
             let decoded = try JSONDecoder().decode(FFRemoteResponse.self, from: data)
             var accepted: [String: FFRemoteGame] = [:]
             for game in FFGameKind.allCases {
                 if let remote = decoded.games[game.rawValue] { accepted[game.rawValue] = remote }
             }
             remoteGames = accepted
+        } catch let error as FFServerAccessError {
+            serverConfigurationError = error.localizedDescription
         } catch let error as FFFeatureError {
             serverConfigurationError = error.localizedDescription
         } catch {
