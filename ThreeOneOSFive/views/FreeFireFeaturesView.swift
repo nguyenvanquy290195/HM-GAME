@@ -42,6 +42,7 @@ struct FFRemoteGame: Decodable {
 struct FFRemoteFeature: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
+    let note: String?
     let enabled: Bool
     let destinationPath: String
     let activeSHA256: String?
@@ -50,7 +51,7 @@ struct FFRemoteFeature: Decodable, Identifiable, Hashable {
     let updatedAt: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, enabled
+        case id, name, note, enabled
         case destinationPath = "destination_path"
         case activeSHA256 = "active_sha256"
         case originalSHA256 = "original_sha256"
@@ -1191,6 +1192,14 @@ struct FreeFireFeaturesView: View {
                         : (keyStatus != nil ? accent : (isActive ? accent : Color.white.opacity(0.48)))
                     )
                     .lineLimit(1)
+
+                if let note = feature.note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
+                    Text(note)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.42))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 if !feature.enabled && isActive {
                     Text("Đã ẩn trên server • tắt để khôi phục")
