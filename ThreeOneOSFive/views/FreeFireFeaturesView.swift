@@ -76,6 +76,9 @@ struct FFAccessGrant: Decodable {
     let downloadSHA256: String?
     let expiresIn: Int?
     let destinationPath: String
+    let keyExpiresAt: String?
+    let maxDevices: Int?
+    let deviceCount: Int?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -84,7 +87,16 @@ struct FFAccessGrant: Decodable {
         case downloadSHA256 = "download_sha256"
         case expiresIn = "expires_in"
         case destinationPath = "destination_path"
+        case keyExpiresAt = "key_expires_at"
+        case maxDevices = "max_devices"
+        case deviceCount = "device_count"
     }
+}
+
+struct FFKeyAccessInfo: Codable, Hashable {
+    let expiresAt: String
+    let maxDevices: Int
+    let deviceCount: Int
 }
 
 struct FFServerErrorPayload: Decodable {
@@ -440,10 +452,12 @@ enum FFAccessClient {
 final class FreeFireFeatureViewModel: ObservableObject {
     private static let serverAPIURL = "https://miniapp.shopaccvt.site/proxy/api.php"
     private static let activeRecordsKey = "ffFeatureActiveRecords.v2"
+    private static let keyAccessInfoKey = "hmGaming.ffKeyAccessInfo.v1"
 
     @Published var selectedGame: FFGameKind = .freeFire
     @Published private(set) var remoteGames: [String: FFRemoteGame] = [:]
     @Published private(set) var activeRecords: [FFActiveRecord] = []
+    @Published private(set) var keyAccessInfo: [String: FFKeyAccessInfo] = [:]
     @Published private(set) var busyIDs: Set<String> = []
     @Published var isLoading = false
     @Published var notice: String?
@@ -454,6 +468,7 @@ final class FreeFireFeatureViewModel: ObservableObject {
 
     init() {
         activeRecords = Self.readActiveRecords()
+        keyAccessInfo = Self.readKeyAccessInfo()
     }
 
     var visibleFeatures: [FFRemoteFeature] {
@@ -532,6 +547,8 @@ final class FreeFireFeatureViewModel: ObservableObject {
                         try await performActivation(feature: feature, game: game, key: nil, accessToken: token)
                     } catch let auth as FFServerAccessError where auth.shouldAskForKey {
                         FFAccessTokenStore.delete(game: game, featureID: feature.id)
+                        keyAccessInfo.removeValue(forKey: operation)
+                        persistKeyAccessInfo()
                         keyPrompt = FFKeyPrompt(feature: feature, game: game)
                     } catch {
                         notice = error.localizedDescription
@@ -569,6 +586,13 @@ final class FreeFireFeatureViewModel: ObservableObject {
         if let newToken = grant.accessToken, !newToken.isEmpty {
             FFAccessTokenStore.store(newToken, game: game, featureID: feature.id)
         }
+
+        keyAccessInfo[operationKey(featureID: feature.id, game: game)] = FFKeyAccessInfo(
+            expiresAt: grant.keyExpiresAt ?? "",
+            maxDevices: max(1, grant.maxDevices ?? 1),
+            deviceCount: max(0, grant.deviceCount ?? 0)
+        )
+        persistKeyAccessInfo()
 
         _ = try await FFFeatureInstaller.install(
             remoteURL: grant.downloadURL,
@@ -657,6 +681,54 @@ final class FreeFireFeatureViewModel: ObservableObject {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed), url.scheme?.lowercased() == "https", url.host != nil else { return nil }
         return url
+    }
+
+    func keyStatusText(for feature: FFRemoteFeature, game: FFGameKind? = nil) -> String? {
+        let resolvedGame = game ?? selectedGame
+        let key = operationKey(featureID: feature.id, game: resolvedGame)
+        guard let info = keyAccessInfo[key] else { return nil }
+
+        let deviceText = "\(info.deviceCount)/\(info.maxDevices) thiết bị"
+        let rawExpiry = info.expiresAt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawExpiry.isEmpty else {
+            return "Key: Vô hạn • \(deviceText)"
+        }
+
+        let formatter = ISO8601DateFormatter()
+        guard let expiry = formatter.date(from: rawExpiry) else {
+            return "Key còn hạn • \(deviceText)"
+        }
+
+        let remaining = expiry.timeIntervalSinceNow
+        guard remaining > 0 else {
+            return "Key đã hết hạn"
+        }
+
+        let totalMinutes = Int(remaining / 60)
+        let days = totalMinutes / (24 * 60)
+        let hours = (totalMinutes % (24 * 60)) / 60
+        let minutes = totalMinutes % 60
+
+        let timeText: String
+        if days > 0 {
+            timeText = hours > 0 ? "\(days) ngày \(hours) giờ" : "\(days) ngày"
+        } else if hours > 0 {
+            timeText = minutes > 0 ? "\(hours) giờ \(minutes) phút" : "\(hours) giờ"
+        } else {
+            timeText = "\(max(1, minutes)) phút"
+        }
+        return "Còn hạn: \(timeText) • \(deviceText)"
+    }
+
+    private func persistKeyAccessInfo() {
+        guard let data = try? JSONEncoder().encode(keyAccessInfo) else { return }
+        UserDefaults.standard.set(data, forKey: Self.keyAccessInfoKey)
+    }
+
+    private static func readKeyAccessInfo() -> [String: FFKeyAccessInfo] {
+        guard let data = UserDefaults.standard.data(forKey: keyAccessInfoKey),
+              let info = try? JSONDecoder().decode([String: FFKeyAccessInfo].self, from: data) else { return [:] }
+        return info
     }
 
     private func persistActiveRecords() {
@@ -1092,9 +1164,14 @@ struct FreeFireFeaturesView: View {
                     .foregroundStyle(.white)
                     .lineLimit(1)
 
-                Text(isActive ? "Đang kích hoạt" : "Key riêng • \(presentation.subtitle)")
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(isActive ? accent : Color.white.opacity(0.48))
+                let keyStatus = model.keyStatusText(for: feature)
+                Text(keyStatus ?? (isActive ? "Đang kích hoạt" : "Key riêng • \(presentation.subtitle)"))
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(
+                        keyStatus == "Key đã hết hạn"
+                        ? Color.red.opacity(0.88)
+                        : (keyStatus != nil ? accent : (isActive ? accent : Color.white.opacity(0.48)))
+                    )
                     .lineLimit(1)
 
                 if !feature.enabled && isActive {
