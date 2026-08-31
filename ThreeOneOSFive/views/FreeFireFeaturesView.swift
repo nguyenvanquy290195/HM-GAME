@@ -88,6 +88,7 @@ struct FFActiveRecord: Codable, Identifiable, Hashable {
     let name: String
     let destinationPath: String
     let originalSHA256: String?
+    let category: String?
 
     var id: String { "\(game.rawValue):\(featureID)" }
 }
@@ -150,6 +151,8 @@ enum FFFeatureError: Error, LocalizedError {
     case targetMissing(String)
     case targetIsDirectory
     case symbolicLinkUnsupported
+    case fileInfoPatternMissing(String)
+    case fileInfoTooLarge
     case installFailed
 
     var errorDescription: String? {
@@ -180,6 +183,10 @@ enum FFFeatureError: Error, LocalizedError {
             return "Đường dẫn đích đang trỏ tới một thư mục, không phải file."
         case .symbolicLinkUnsupported:
             return "Không hỗ trợ đường dẫn có symbolic link."
+        case .fileInfoPatternMissing(let pattern):
+            return "Không tìm thấy chuỗi \(pattern) trong fileinfo."
+        case .fileInfoTooLarge:
+            return "File fileinfo quá lớn để xử lý an toàn."
         case .installFailed:
             return "Không thể thay file vào data game."
         }
@@ -274,7 +281,7 @@ enum FFFeatureInstaller {
         }
     }
 
-    private static func validatedTargetURL(
+    fileprivate static func validatedTargetURL(
         containerPath: String,
         relativePath rawPath: String,
         fileManager: FileManager = .default
@@ -332,6 +339,93 @@ enum FFFeatureInstaller {
             hasher.update(data: data)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// MARK: - ESP fileinfo patch
+
+enum FFFileInfoPatcher {
+    static let relativePath = "Documents/contentcache/Optional/ios/fileinfo"
+    private static let normalPrefix = Data("shaders,".utf8)
+    private static let espPrefix = Data("optionalab,".utf8)
+    private static let maximumFileSize = 64 * 1_024 * 1_024
+
+    /// Changes the first exact `shaders,` marker to `optionalab,`.
+    /// Returns true only when this call actually changed fileinfo.
+    static func enable(game: FFGameKind) async throws -> Bool {
+        try await replaceMarker(game: game, from: normalPrefix, to: espPrefix, sourceLabel: "shaders,")
+    }
+
+    /// Changes the first exact `optionalab,` marker back to `shaders,`.
+    /// Returns true only when this call actually changed fileinfo.
+    static func disable(game: FFGameKind) async throws -> Bool {
+        try await replaceMarker(game: game, from: espPrefix, to: normalPrefix, sourceLabel: "optionalab,")
+    }
+
+    private static func replaceMarker(
+        game: FFGameKind,
+        from source: Data,
+        to replacement: Data,
+        sourceLabel: String
+    ) async throws -> Bool {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    guard let containerPath = ContainerStore.resolveAppContainerPath(bundleID: game.bundleID) else {
+                        throw FFFeatureError.containerUnavailable(game.bundleID)
+                    }
+
+                    var activationError: NSString?
+                    let mcmHandle = MCMActivateContainer(2, game.bundleID, false, &activationError)
+                    if mcmHandle < 0 {
+                        _ = ContainerStore.grantContainerAccess(containerPath)
+                    }
+
+                    let targetURL = try FFFeatureInstaller.validatedTargetURL(
+                        containerPath: containerPath,
+                        relativePath: relativePath
+                    )
+
+                    let values = try targetURL.resourceValues(forKeys: [.fileSizeKey])
+                    if let size = values.fileSize, size > maximumFileSize {
+                        throw FFFeatureError.fileInfoTooLarge
+                    }
+
+                    var contents = try Data(contentsOf: targetURL, options: [.mappedIfSafe])
+                    if let range = contents.range(of: source) {
+                        contents.replaceSubrange(range, with: replacement)
+                    } else if contents.range(of: replacement) != nil {
+                        // Already in the requested state. Treat as success so toggling stays idempotent.
+                        continuation.resume(returning: false)
+                        return
+                    } else {
+                        throw FFFeatureError.fileInfoPatternMissing(sourceLabel)
+                    }
+
+                    let temporaryURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("hm-fileinfo-\(UUID().uuidString)")
+                    defer { try? FileManager.default.removeItem(at: temporaryURL) }
+                    try contents.write(to: temporaryURL, options: .atomic)
+                    _ = try FileReplacementService.replace(target: targetURL, with: temporaryURL)
+                    continuation.resume(returning: true)
+                } catch let error as FFFeatureError {
+                    continuation.resume(throwing: error)
+                } catch let error as FileReplacementError {
+                    switch error {
+                    case .targetMissing:
+                        continuation.resume(throwing: FFFeatureError.targetMissing(relativePath))
+                    case .targetIsDirectory:
+                        continuation.resume(throwing: FFFeatureError.targetIsDirectory)
+                    case .symbolicLinkUnsupported:
+                        continuation.resume(throwing: FFFeatureError.symbolicLinkUnsupported)
+                    default:
+                        continuation.resume(throwing: FFFeatureError.installFailed)
+                    }
+                } catch {
+                    continuation.resume(throwing: FFFeatureError.installFailed)
+                }
+            }
+        }
     }
 }
 
@@ -641,12 +735,27 @@ final class FreeFireFeatureViewModel: ObservableObject {
         )
         persistKeyAccessInfo()
 
-        _ = try await FFFeatureInstaller.install(
-            remoteURL: grant.downloadURL,
-            expectedSHA256: grant.downloadSHA256 ?? feature.activeSHA256,
-            game: game,
-            destinationPath: grant.destinationPath
-        )
+        let isESP = feature.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == FFFeatureCategory.esp.rawValue
+        var changedFileInfo = false
+        if isESP {
+            changedFileInfo = try await FFFileInfoPatcher.enable(game: game)
+        }
+
+        do {
+            _ = try await FFFeatureInstaller.install(
+                remoteURL: grant.downloadURL,
+                expectedSHA256: grant.downloadSHA256 ?? feature.activeSHA256,
+                game: game,
+                destinationPath: grant.destinationPath
+            )
+        } catch {
+            // If this activation was the call that changed fileinfo, undo it when
+            // the ESP file cannot be installed so the game is not left half-enabled.
+            if isESP && changedFileInfo {
+                _ = try? await FFFileInfoPatcher.disable(game: game)
+            }
+            throw error
+        }
 
         activeRecords.removeAll {
             $0.game == game &&
@@ -659,7 +768,8 @@ final class FreeFireFeatureViewModel: ObservableObject {
             featureID: feature.id,
             name: feature.name,
             destinationPath: grant.destinationPath,
-            originalSHA256: feature.originalSHA256
+            originalSHA256: feature.originalSHA256,
+            category: feature.category
         ))
         persistActiveRecords()
         notice = "Đã bật \(feature.name) thành công"
@@ -669,16 +779,22 @@ final class FreeFireFeatureViewModel: ObservableObject {
         let operation = operationKey(featureID: feature.id, game: game)
         guard !busyIDs.contains(operation) else { return }
         guard let record = activeRecord(forFeatureID: feature.id, game: game) else { return }
-        guard let token = FFAccessTokenStore.load(game: game, featureID: feature.id) else {
-            notice = "Không tìm thấy phiên khôi phục của chức năng này."
-            return
-        }
+        let isESP = feature.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == FFFeatureCategory.esp.rawValue
+
         busyIDs.insert(operation)
         Task {
             defer { busyIDs.remove(operation) }
             do {
-                try await performRestore(record: record, accessToken: token)
-                notice = "Đã tắt \(feature.name) và khôi phục file gốc"
+                if isESP {
+                    try await performESPRestore(record: record)
+                    notice = "Đã tắt \(feature.name) thành công"
+                } else {
+                    guard let token = FFAccessTokenStore.load(game: game, featureID: feature.id) else {
+                        throw FFFeatureError.serverMessage("Không tìm thấy phiên khôi phục của chức năng này.")
+                    }
+                    try await performRestore(record: record, accessToken: token)
+                    notice = "Đã tắt \(feature.name) và khôi phục file gốc"
+                }
             } catch {
                 notice = error.localizedDescription
             }
@@ -688,7 +804,9 @@ final class FreeFireFeatureViewModel: ObservableObject {
     func restoreOrphan(_ record: FFActiveRecord) {
         let operation = operationKey(featureID: record.featureID, game: record.game)
         guard !busyIDs.contains(operation) else { return }
-        guard let token = FFAccessTokenStore.load(game: record.game, featureID: record.featureID) else {
+        let isESP = record.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == FFFeatureCategory.esp.rawValue
+        let token = FFAccessTokenStore.load(game: record.game, featureID: record.featureID)
+        if !isESP && token == nil {
             notice = "Không tìm thấy phiên khôi phục cho \(record.name)."
             return
         }
@@ -696,12 +814,32 @@ final class FreeFireFeatureViewModel: ObservableObject {
         Task {
             defer { busyIDs.remove(operation) }
             do {
-                try await performRestore(record: record, accessToken: token)
-                notice = "Đã khôi phục file gốc cho \(record.name)."
+                if isESP {
+                    try await performESPRestore(record: record)
+                    notice = "Đã tắt \(record.name) thành công."
+                } else if let token {
+                    try await performRestore(record: record, accessToken: token)
+                    notice = "Đã khôi phục file gốc cho \(record.name)."
+                }
             } catch {
                 notice = error.localizedDescription
             }
         }
+    }
+
+    private func performESPRestore(record: FFActiveRecord) async throws {
+        let hasAnotherActiveESP = activeRecords.contains { other in
+            other.game == record.game &&
+            other.featureID != record.featureID &&
+            other.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == FFFeatureCategory.esp.rawValue
+        }
+
+        // Keep fileinfo in optionalab mode while another ESP is still active.
+        if !hasAnotherActiveESP {
+            _ = try await FFFileInfoPatcher.disable(game: record.game)
+        }
+        activeRecords.removeAll { $0.id == record.id }
+        persistActiveRecords()
     }
 
     private func performRestore(record: FFActiveRecord, accessToken: String) async throws {
