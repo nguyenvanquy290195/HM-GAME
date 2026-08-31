@@ -3,6 +3,7 @@ import Foundation
 import CryptoKit
 import Security
 import UIKit
+import SafariServices
 
 // MARK: - Fixed game scope
 
@@ -1039,10 +1040,26 @@ struct FFKeyEntrySheet: View {
     }
 }
 
+// MARK: - In-app GetKey browser
+
+struct FFGetKeySafariView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let controller = SFSafariViewController(url: url)
+        controller.preferredControlTintColor = UIColor(red: 1.0, green: 0.72, blue: 0.05, alpha: 1.0)
+        controller.dismissButtonStyle = .close
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
+}
+
 // MARK: - UI
 
 struct FreeFireFeaturesView: View {
     @StateObject private var model = FreeFireFeatureViewModel()
+    @State private var showGetKey = false
 
     private let accent = Color(red: 1.0, green: 0.72, blue: 0.05)
     private let card = Color(red: 0.075, green: 0.075, blue: 0.082)
@@ -1058,6 +1075,7 @@ struct FreeFireFeaturesView: View {
                     heroBanner
                     gameSelector
                     categorySelector
+                    getKeyButton
                     featureHeader
                     mainContent
                     statusCard
@@ -1081,6 +1099,12 @@ struct FreeFireFeaturesView: View {
         }
         .sheet(item: $model.keyPrompt) { prompt in
             FFKeyEntrySheet(model: model, prompt: prompt)
+        }
+        .sheet(isPresented: $showGetKey) {
+            if let url = getKeyURL {
+                FFGetKeySafariView(url: url)
+                    .ignoresSafeArea()
+            }
         }
         .onAppear { model.loadIfNeeded() }
     }
@@ -1259,6 +1283,46 @@ struct FreeFireFeaturesView: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    private var getKeyButton: some View {
+        Button {
+            showGetKey = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "key.fill")
+                    .font(.system(size: 15, weight: .bold))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("NHẬN KEY")
+                        .font(.system(size: 14, weight: .heavy, design: .rounded))
+                    Text("\(model.selectedGame.title) • \(model.selectedCategory.title)")
+                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                        .opacity(0.68)
+                }
+
+                Spacer()
+
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 13, weight: .bold))
+            }
+            .foregroundStyle(.black)
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity)
+            .frame(height: 54)
+            .background(accent, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .shadow(color: accent.opacity(0.18), radius: 12, y: 4)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var getKeyURL: URL? {
+        guard var components = URLComponents(string: "https://miniapp.shopaccvt.site/proxy/getkey.php") else { return nil }
+        components.queryItems = [
+            URLQueryItem(name: "game", value: model.selectedGame.rawValue),
+            URLQueryItem(name: "category", value: model.selectedCategory.rawValue)
+        ]
+        return components.url
     }
 
     private var featureHeader: some View {
