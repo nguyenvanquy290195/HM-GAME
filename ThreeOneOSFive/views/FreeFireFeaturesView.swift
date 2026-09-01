@@ -58,7 +58,18 @@ struct FFRemoteResponse: Decodable {
 
 struct FFRemoteGame: Decodable {
     let name: String?
+    let bundleID: String?
+    let iconURL: String?
+    let sortOrder: Int?
+    let system: Bool?
     let features: [FFRemoteFeature]
+
+    enum CodingKeys: String, CodingKey {
+        case name, features, system
+        case bundleID = "bundle_id"
+        case iconURL = "icon_url"
+        case sortOrder = "sort_order"
+    }
 }
 
 struct FFRemoteFeature: Decodable, Identifiable, Hashable {
@@ -196,6 +207,20 @@ enum FFFeatureInstaller {
         game: FFGameKind,
         destinationPath: String
     ) async throws -> Int64 {
+        try await install(
+            remoteURL: remoteURL,
+            expectedSHA256: expectedSHA256,
+            bundleID: game.bundleID,
+            destinationPath: destinationPath
+        )
+    }
+
+    static func install(
+        remoteURL: String,
+        expectedSHA256: String?,
+        bundleID: String,
+        destinationPath: String
+    ) async throws -> Int64 {
         guard let url = URL(string: remoteURL),
               url.scheme?.lowercased() == "https",
               url.host != nil else {
@@ -234,13 +259,13 @@ enum FFFeatureInstaller {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    guard let containerPath = ContainerStore.resolveAppContainerPath(bundleID: game.bundleID) else {
-                        throw FFFeatureError.containerUnavailable(game.bundleID)
+                    guard let containerPath = ContainerStore.resolveAppContainerPath(bundleID: bundleID) else {
+                        throw FFFeatureError.containerUnavailable(bundleID)
                     }
 
                     // Mirror the Files tab access grant before attempting a write.
                     var activationError: NSString?
-                    let mcmHandle = MCMActivateContainer(2, game.bundleID, false, &activationError)
+                    let mcmHandle = MCMActivateContainer(2, bundleID, false, &activationError)
                     if mcmHandle < 0 {
                         _ = ContainerStore.grantContainerAccess(containerPath)
                     }
@@ -351,16 +376,20 @@ struct FFServerAccessError: Error, LocalizedError {
 enum FFAccessTokenStore {
     private static let service = "com.apple.mobile.MobileHouseArrest.ff-feature-access"
 
-    private static func account(game: FFGameKind, featureID: String) -> String {
-        "\(game.rawValue):\(featureID)"
+    private static func account(gameKey: String, featureID: String) -> String {
+        "\(gameKey):\(featureID)"
     }
 
-    static func store(_ token: String, game: FFGameKind, featureID: String) {
+    private static func account(game: FFGameKind, featureID: String) -> String {
+        account(gameKey: game.rawValue, featureID: featureID)
+    }
+
+    static func store(_ token: String, gameKey: String, featureID: String) {
         guard let data = token.data(using: .utf8), !data.isEmpty else { return }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account(game: game, featureID: featureID)
+            kSecAttrAccount as String: account(gameKey: gameKey, featureID: featureID)
         ]
         let attrs: [String: Any] = [
             kSecValueData as String: data,
@@ -375,11 +404,15 @@ enum FFAccessTokenStore {
         }
     }
 
-    static func load(game: FFGameKind, featureID: String) -> String? {
+    static func store(_ token: String, game: FFGameKind, featureID: String) {
+        store(token, gameKey: game.rawValue, featureID: featureID)
+    }
+
+    static func load(gameKey: String, featureID: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account(game: game, featureID: featureID),
+            kSecAttrAccount as String: account(gameKey: gameKey, featureID: featureID),
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -389,13 +422,21 @@ enum FFAccessTokenStore {
         return String(data: data, encoding: .utf8)
     }
 
-    static func delete(game: FFGameKind, featureID: String) {
+    static func load(game: FFGameKind, featureID: String) -> String? {
+        load(gameKey: game.rawValue, featureID: featureID)
+    }
+
+    static func delete(gameKey: String, featureID: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account(game: game, featureID: featureID)
+            kSecAttrAccount as String: account(gameKey: gameKey, featureID: featureID)
         ]
         _ = SecItemDelete(query as CFDictionary)
+    }
+
+    static func delete(game: FFGameKind, featureID: String) {
+        delete(gameKey: game.rawValue, featureID: featureID)
     }
 }
 
@@ -445,6 +486,39 @@ enum FFAccessClient {
             "action": "restore",
             "game": record.game.rawValue,
             "feature_id": record.featureID,
+            "device_id": FFDeviceIdentity.value,
+            "build_id": HMBuildIdentity.id,
+            "access_token": accessToken
+        ])
+    }
+
+    static func activate(
+        feature: FFRemoteFeature,
+        gameKey: String,
+        key: String? = nil,
+        accessToken: String? = nil
+    ) async throws -> FFAccessGrant {
+        var body: [String: Any] = [
+            "action": "activate",
+            "game": gameKey,
+            "feature_id": feature.id,
+            "device_id": FFDeviceIdentity.value,
+            "build_id": HMBuildIdentity.id
+        ]
+        if let key, !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["key"] = key }
+        if let accessToken, !accessToken.isEmpty { body["access_token"] = accessToken }
+        return try await request(body)
+    }
+
+    static func restore(
+        gameKey: String,
+        featureID: String,
+        accessToken: String
+    ) async throws -> FFAccessGrant {
+        try await request([
+            "action": "restore",
+            "game": gameKey,
+            "feature_id": featureID,
             "device_id": FFDeviceIdentity.value,
             "build_id": HMBuildIdentity.id,
             "access_token": accessToken
@@ -920,9 +994,15 @@ struct FFGetKeySafariView: UIViewControllerRepresentable {
 // MARK: - UI
 
 struct FreeFireFeaturesView: View {
+    let lockedGame: FFGameKind?
+
     @StateObject private var model = FreeFireFeatureViewModel()
     @State private var showGetKey = false
     @State private var noticeDismissTask: Task<Void, Never>?
+
+    init(lockedGame: FFGameKind? = nil) {
+        self.lockedGame = lockedGame
+    }
 
     private let accent = Color(red: 1.0, green: 0.72, blue: 0.05)
     private let card = Color(red: 0.075, green: 0.075, blue: 0.082)
@@ -936,7 +1016,9 @@ struct FreeFireFeaturesView: View {
                 LazyVStack(spacing: 18) {
                     topHeader
                     heroBanner
-                    gameSelector
+                    if lockedGame == nil {
+                        gameSelector
+                    }
                     categorySelector
                     getKeyButton
                     featureHeader
@@ -966,7 +1048,13 @@ struct FreeFireFeaturesView: View {
                     .ignoresSafeArea()
             }
         }
-        .onAppear { model.loadIfNeeded() }
+        .onAppear {
+            if let lockedGame {
+                model.selectedGame = lockedGame
+                model.selectedCategory = .aim
+            }
+            model.loadIfNeeded()
+        }
         .onChange(of: model.notice) { newValue in
             noticeDismissTask?.cancel()
             guard newValue != nil else { return }
@@ -1096,8 +1184,8 @@ struct FreeFireFeaturesView: View {
             .clipped()
 
             VStack(alignment: .leading, spacing: 7) {
-                Text("FREE FIRE")
-                    .font(.system(size: 34, weight: .black, design: .rounded))
+                Text(model.selectedGame == .freeFire ? "FREE FIRE" : "FREE FIRE MAX")
+                    .font(.system(size: model.selectedGame == .freeFire ? 34 : 28, weight: .black, design: .rounded))
                     .foregroundStyle(.white)
 
                 Text("SERVER FEATURE PANEL")
@@ -1105,7 +1193,7 @@ struct FreeFireFeaturesView: View {
                     .tracking(1.8)
                     .foregroundStyle(accent)
 
-                Text("Chọn phiên bản game và bật chức năng bạn muốn sử dụng.")
+                Text("Chọn AIM hoặc ESP rồi bật chức năng bạn muốn sử dụng.")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(Color.white.opacity(0.58))
                     .frame(maxWidth: 230, alignment: .leading)
