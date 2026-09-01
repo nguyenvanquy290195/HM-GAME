@@ -318,7 +318,6 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
     private static let keyInfoKey = "hmGaming.onlineGameKeyInfo.v1"
 
     let game: HMOnlineGame
-    @Published var selectedCategory: FFFeatureCategory = .aim
     @Published private(set) var features: [FFRemoteFeature] = []
     @Published private(set) var activeRecords: [HMOnlineActiveRecord] = []
     @Published private(set) var keyAccessInfo: [String: FFKeyAccessInfo] = [:]
@@ -338,8 +337,7 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
 
     var visibleFeatures: [FFRemoteFeature] {
         features.filter { feature in
-            let category = feature.category?.lowercased() ?? "aim"
-            return category == selectedCategory.rawValue && (feature.enabled || isActive(feature))
+            feature.enabled || isActive(feature)
         }
     }
 
@@ -564,7 +562,6 @@ struct HMOnlineGameFeaturesView: View {
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 14) {
                     gameHeader
-                    categorySelector
                     getKeyButton
                     featureHeader
                     content
@@ -634,28 +631,6 @@ struct HMOnlineGameFeaturesView: View {
         .overlay(RoundedRectangle(cornerRadius: 20).stroke(border, lineWidth: 1))
     }
 
-    private var categorySelector: some View {
-        HStack(spacing: 10) {
-            ForEach(FFFeatureCategory.allCases) { category in
-                let selected = model.selectedCategory == category
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) { model.selectedCategory = category }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: category.icon)
-                        Text(category.title)
-                    }
-                    .font(.system(size: 13.5, weight: .heavy, design: .rounded))
-                    .foregroundStyle(selected ? Color.black : Color.white.opacity(0.68))
-                    .frame(maxWidth: .infinity).padding(.vertical, 11)
-                    .background(selected ? accent : card, in: RoundedRectangle(cornerRadius: 14))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(selected ? accent : border, lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
     private var getKeyButton: some View {
         Button { showGetKey = true } label: {
             HStack {
@@ -671,7 +646,7 @@ struct HMOnlineGameFeaturesView: View {
 
     private var getKeyURL: URL? {
         guard var c = URLComponents(string: "https://miniapp.shopaccvt.site/proxy/getkey.php") else { return nil }
-        c.queryItems = [URLQueryItem(name: "game", value: game.id), URLQueryItem(name: "category", value: model.selectedCategory.rawValue)]
+        c.queryItems = [URLQueryItem(name: "game", value: game.id)]
         return c.url
     }
 
@@ -694,7 +669,7 @@ struct HMOnlineGameFeaturesView: View {
         } else if model.isLoading && model.visibleFeatures.isEmpty {
             stateCard("Đang tải danh sách chức năng…")
         } else if model.visibleFeatures.isEmpty && model.orphanedActiveRecords.isEmpty {
-            stateCard("Chưa có chức năng \(model.selectedCategory.title). Thêm trên Admin rồi làm mới.")
+            stateCard("Chưa có chức năng. Thêm trên Admin rồi làm mới.")
         } else {
             ForEach(model.visibleFeatures) { feature in featureCard(feature) }
             ForEach(model.orphanedActiveRecords) { record in orphanCard(record) }
@@ -711,7 +686,7 @@ struct HMOnlineGameFeaturesView: View {
         let busy = model.isBusy(feature)
         return HStack(spacing: 13) {
             RoundedRectangle(cornerRadius: 14).fill(accent.opacity(active ? 0.18 : 0.09)).frame(width: 50, height: 50).overlay {
-                Image(systemName: model.selectedCategory == .esp ? "eye.fill" : "scope").font(.system(size: 20, weight: .bold)).foregroundStyle(accent)
+                Image(systemName: "slider.horizontal.3").font(.system(size: 20, weight: .bold)).foregroundStyle(accent)
             }
             VStack(alignment: .leading, spacing: 5) {
                 Text(feature.name.uppercased()).font(.system(size: 14.5, weight: .heavy, design: .rounded)).foregroundStyle(.white).lineLimit(1)
