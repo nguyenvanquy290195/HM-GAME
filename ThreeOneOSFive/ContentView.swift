@@ -508,6 +508,60 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
         persistActiveRecords()
     }
 
+    func restoreExpiredFeaturesIfNeeded() async {
+        let now = Date()
+        let records = activeRecords.filter { $0.gameKey == game.id }
+
+        for record in records {
+            let op = operationKey(record.featureID)
+            guard !busyIDs.contains(op),
+                  let info = keyAccessInfo[op],
+                  let expiry = keyExpiryDate(info.expiresAt),
+                  expiry <= now else { continue }
+
+            guard let token = FFAccessTokenStore.load(gameKey: game.id, featureID: record.featureID) else {
+                continue
+            }
+
+            busyIDs.insert(op)
+            do {
+                try await performRestore(record, token: token)
+                FFAccessTokenStore.delete(gameKey: game.id, featureID: record.featureID)
+                keyAccessInfo.removeValue(forKey: op)
+                persistKeyInfo()
+                // Key hết hạn: tự tắt im lặng, không hiển thị toast/popup.
+            } catch {
+                // Giữ phiên đang hoạt động để thử khôi phục lại ở lần kiểm tra tiếp theo.
+                // Không hiển thị thông báo khi quá trình tự tắt do hết hạn thất bại.
+            }
+            busyIDs.remove(op)
+        }
+    }
+
+    func nextExpiryDelay() -> TimeInterval? {
+        let now = Date()
+        let activeIDs = Set(activeRecords.filter { $0.gameKey == game.id }.map(\.featureID))
+        let expiries = activeIDs.compactMap { featureID -> Date? in
+            guard let info = keyAccessInfo[operationKey(featureID)] else { return nil }
+            return keyExpiryDate(info.expiresAt)
+        }.filter { $0 > now }
+
+        guard let next = expiries.min() else { return nil }
+        return max(0.25, next.timeIntervalSince(now))
+    }
+
+    private func keyExpiryDate(_ raw: String) -> Date? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+
+        let normal = ISO8601DateFormatter()
+        if let date = normal.date(from: value) { return date }
+
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: value)
+    }
+
     func keyStatusText(_ feature: FFRemoteFeature) -> String? {
         guard let info = keyAccessInfo[operationKey(feature.id)] else { return nil }
         let device = "\(info.deviceCount)/\(info.maxDevices) thiết bị"
@@ -543,9 +597,11 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
 
 struct HMOnlineGameFeaturesView: View {
     let game: HMOnlineGame
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: HMOnlineGameFeatureViewModel
     @State private var showGetKey = false
     @State private var noticeDismissTask: Task<Void, Never>?
+    @State private var expiryWatchTask: Task<Void, Never>?
 
     private let accent = Color(red: 1.0, green: 0.72, blue: 0.05)
     private let card = Color(red: 0.075, green: 0.075, blue: 0.082)
@@ -593,7 +649,24 @@ struct HMOnlineGameFeaturesView: View {
         .sheet(isPresented: $showGetKey) {
             if let url = getKeyURL { FFGetKeySafariView(url: url).ignoresSafeArea() }
         }
-        .onAppear { model.loadIfNeeded() }
+        .onAppear {
+            model.loadIfNeeded()
+            startExpiryWatcher()
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                startExpiryWatcher()
+            } else {
+                expiryWatchTask?.cancel()
+                expiryWatchTask = nil
+            }
+        }
+        .onChange(of: model.activeRecords) { _ in
+            if scenePhase == .active { startExpiryWatcher() }
+        }
+        .onChange(of: model.keyAccessInfo) { _ in
+            if scenePhase == .active { startExpiryWatcher() }
+        }
         .onChange(of: model.notice) { value in
             noticeDismissTask?.cancel()
             guard value != nil else { return }
@@ -603,7 +676,26 @@ struct HMOnlineGameFeaturesView: View {
                 await MainActor.run { withAnimation(.easeOut(duration: 0.2)) { model.notice = nil } }
             }
         }
-        .onDisappear { noticeDismissTask?.cancel() }
+        .onDisappear {
+            noticeDismissTask?.cancel()
+            expiryWatchTask?.cancel()
+            expiryWatchTask = nil
+        }
+    }
+
+    private func startExpiryWatcher() {
+        expiryWatchTask?.cancel()
+        expiryWatchTask = Task {
+            while !Task.isCancelled {
+                await model.restoreExpiredFeaturesIfNeeded()
+                guard !Task.isCancelled else { return }
+
+                let delay = await MainActor.run { model.nextExpiryDelay() }
+                let seconds = min(max(delay ?? 60, 0.25), 60)
+                let nanos = UInt64(seconds * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+            }
+        }
     }
 
     private var gameHeader: some View {
