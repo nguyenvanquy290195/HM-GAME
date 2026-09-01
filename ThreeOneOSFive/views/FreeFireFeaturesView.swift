@@ -679,7 +679,7 @@ final class FreeFireFeatureViewModel: ObservableObject {
             defer { busyIDs.remove(operation) }
             do {
                 try await performRestore(record: record, accessToken: token)
-                notice = "Đã tắt \(feature.name) và khôi phục file gốc"
+                notice = "Đã tắt \(feature.name) thành công"
             } catch {
                 notice = error.localizedDescription
             }
@@ -922,13 +922,14 @@ struct FFGetKeySafariView: UIViewControllerRepresentable {
 struct FreeFireFeaturesView: View {
     @StateObject private var model = FreeFireFeatureViewModel()
     @State private var showGetKey = false
+    @State private var noticeDismissTask: Task<Void, Never>?
 
     private let accent = Color(red: 1.0, green: 0.72, blue: 0.05)
     private let card = Color(red: 0.075, green: 0.075, blue: 0.082)
     private let cardBorder = Color.white.opacity(0.085)
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
 
             ScrollView(showsIndicators: false) {
@@ -947,17 +948,14 @@ struct FreeFireFeaturesView: View {
                 .padding(.bottom, 28)
             }
             .refreshable { await model.reload() }
-        }
-        .alert(
-            "Thông báo",
-            isPresented: Binding(
-                get: { model.notice != nil },
-                set: { if !$0 { model.notice = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) { model.notice = nil }
-        } message: {
-            Text(model.notice ?? "")
+
+            if let notice = model.notice {
+                noticeToast(notice)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(100)
+            }
         }
         .sheet(item: $model.keyPrompt) { prompt in
             FFKeyEntrySheet(model: model, prompt: prompt)
@@ -969,6 +967,65 @@ struct FreeFireFeaturesView: View {
             }
         }
         .onAppear { model.loadIfNeeded() }
+        .onChange(of: model.notice) { newValue in
+            noticeDismissTask?.cancel()
+            guard newValue != nil else { return }
+
+            noticeDismissTask = Task {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        model.notice = nil
+                    }
+                }
+            }
+        }
+        .onDisappear {
+            noticeDismissTask?.cancel()
+        }
+    }
+
+    private func noticeToast(_ text: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: toastIcon(for: text))
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(toastAccent(for: text))
+
+            Text(text)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(red: 0.075, green: 0.075, blue: 0.082).opacity(0.98))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(toastAccent(for: text).opacity(0.45), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.38), radius: 14, y: 7)
+    }
+
+    private func toastAccent(for text: String) -> Color {
+        let lowered = text.lowercased()
+        if lowered.contains("đã bật") || lowered.contains("đã tắt") || lowered.contains("đã khôi phục") {
+            return Color.green
+        }
+        return accent
+    }
+
+    private func toastIcon(for text: String) -> String {
+        let lowered = text.lowercased()
+        if lowered.contains("đã bật") || lowered.contains("đã tắt") || lowered.contains("đã khôi phục") {
+            return "checkmark.circle.fill"
+        }
+        return "exclamationmark.circle.fill"
     }
 
     private var topHeader: some View {
