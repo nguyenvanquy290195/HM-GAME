@@ -1,4 +1,6 @@
 import SwiftUI
+import UIKit
+import BackgroundTasks
 
 struct HMOnlineGame: Identifiable, Hashable, Codable {
     let id: String
@@ -101,6 +103,7 @@ private enum HMHomeDestination: Hashable {
 
 struct ContentView: View {
     @EnvironmentObject private var patchDraftCoordinator: PatchDraftCoordinator
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var appsModel = HMOnlineAppsViewModel()
     @State private var path: [HMHomeDestination] = []
 
@@ -150,7 +153,22 @@ struct ContentView: View {
         }
         .tint(accent)
         .preferredColorScheme(.dark)
-        .onAppear { appsModel.loadIfNeeded() }
+        .onAppear {
+            appsModel.loadIfNeeded()
+            HMOnlineExpiryCoordinator.shared.sceneDidBecomeActive()
+        }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .active:
+                HMOnlineExpiryCoordinator.shared.sceneDidBecomeActive()
+            case .background:
+                HMOnlineExpiryCoordinator.shared.sceneDidEnterBackground()
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
+        }
         .onChange(of: patchDraftCoordinator.request?.id) { requestID in
             if requestID != nil { path = [.patch] }
         }
@@ -305,6 +323,229 @@ struct HMOnlineActiveRecord: Codable, Identifiable, Hashable {
     var id: String { "\(gameKey):\(featureID)" }
 }
 
+
+// MARK: - Online app key expiry coordinator
+
+extension Notification.Name {
+    static let hmOnlineExpiryStateDidChange = Notification.Name("hmGaming.onlineExpiryStateDidChange")
+}
+
+@MainActor
+final class HMOnlineExpiryCoordinator {
+    static let shared = HMOnlineExpiryCoordinator()
+    static let backgroundTaskIdentifier = "com.apple.mobile.MobileHouseArrest.hmexpiry"
+
+    private let activeKey = "hmGaming.onlineGameActiveRecords.v1"
+    private let keyInfoKey = "hmGaming.onlineGameKeyInfo.v1"
+
+    private var registeredBackgroundTask = false
+    private var processingIDs: Set<String> = []
+    private var shortBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var shortBackgroundWatcher: Task<Void, Never>?
+
+    private init() {}
+
+    /// Register once during app launch. iOS may run this task later while the app is suspended.
+    func registerBackgroundTask() {
+        guard !registeredBackgroundTask else { return }
+        registeredBackgroundTask = BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: Self.backgroundTaskIdentifier,
+            using: nil
+        ) { task in
+            guard let processingTask = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            Task { @MainActor in
+                self.handleBackgroundProcessingTask(processingTask)
+            }
+        }
+    }
+
+    /// Layer 1: every time HM GAMING becomes active, immediately scan all online-app sessions.
+    func sceneDidBecomeActive() {
+        stopShortBackgroundWatcher()
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.backgroundTaskIdentifier)
+        Task { @MainActor in
+            await restoreExpiredFeaturesIfNeeded()
+        }
+    }
+
+    /// Layer 2: when HM GAMING enters multitasking/background, use the remaining execution window
+    /// and also ask iOS for a BGProcessing wake-up near the next key expiry.
+    func sceneDidEnterBackground() {
+        scheduleNextBackgroundProcessingTask()
+        startShortBackgroundWatcher()
+    }
+
+    func restoreExpiredFeaturesIfNeeded() async {
+        let now = Date()
+        let records = readActiveRecords()
+        let info = readKeyInfo()
+
+        for record in records {
+            let op = operationKey(record)
+            guard !processingIDs.contains(op),
+                  let keyInfo = info[op],
+                  let expiry = keyExpiryDate(keyInfo.expiresAt),
+                  expiry <= now,
+                  let token = FFAccessTokenStore.load(gameKey: record.gameKey, featureID: record.featureID) else {
+                continue
+            }
+
+            processingIDs.insert(op)
+            defer { processingIDs.remove(op) }
+
+            do {
+                let grant = try await FFAccessClient.restore(
+                    gameKey: record.gameKey,
+                    featureID: record.featureID,
+                    accessToken: token
+                )
+                _ = try await FFFeatureInstaller.install(
+                    remoteURL: grant.downloadURL,
+                    expectedSHA256: grant.downloadSHA256 ?? record.originalSHA256,
+                    bundleID: record.bundleID,
+                    destinationPath: grant.destinationPath
+                )
+
+                // Re-read before mutating so a feature enabled while the network request was running
+                // is not accidentally overwritten by stale UserDefaults data.
+                var latestRecords = readActiveRecords()
+                latestRecords.removeAll { $0.id == record.id }
+                persistActiveRecords(latestRecords)
+
+                var latestInfo = readKeyInfo()
+                latestInfo.removeValue(forKey: op)
+                persistKeyInfo(latestInfo)
+
+                FFAccessTokenStore.delete(gameKey: record.gameKey, featureID: record.featureID)
+                NotificationCenter.default.post(name: .hmOnlineExpiryStateDidChange, object: record.id)
+                // Silent by design: no toast, alert or notification.
+            } catch {
+                // Keep the active session and token so the next foreground/background check can retry.
+                // Silent by design.
+            }
+        }
+    }
+
+    func nextExpiryDate() -> Date? {
+        let records = readActiveRecords()
+        let activeIDs = Set(records.map { operationKey($0) })
+        let info = readKeyInfo()
+        return activeIDs.compactMap { key -> Date? in
+            guard let item = info[key] else { return nil }
+            return keyExpiryDate(item.expiresAt)
+        }.min()
+    }
+
+    private func startShortBackgroundWatcher() {
+        stopShortBackgroundWatcher()
+
+        shortBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "HMOnlineKeyExpiry") { [weak self] in
+            Task { @MainActor in
+                self?.stopShortBackgroundWatcher()
+            }
+        }
+
+        shortBackgroundWatcher = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.stopShortBackgroundWatcher() }
+
+            while !Task.isCancelled {
+                await self.restoreExpiredFeaturesIfNeeded()
+                guard !Task.isCancelled else { return }
+
+                guard let next = self.nextExpiryDate() else { return }
+                let remaining = next.timeIntervalSinceNow
+                let seconds = min(max(remaining, 0.25), 12.0)
+                let nanos = UInt64(seconds * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+            }
+        }
+    }
+
+    private func stopShortBackgroundWatcher() {
+        shortBackgroundWatcher?.cancel()
+        shortBackgroundWatcher = nil
+        if shortBackgroundTask != .invalid {
+            UIApplication.shared.endBackgroundTask(shortBackgroundTask)
+            shortBackgroundTask = .invalid
+        }
+    }
+
+    private func scheduleNextBackgroundProcessingTask() {
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.backgroundTaskIdentifier)
+        guard let next = nextExpiryDate() else { return }
+
+        let request = BGProcessingTaskRequest(identifier: Self.backgroundTaskIdentifier)
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = false
+        request.earliestBeginDate = max(next, Date().addingTimeInterval(1))
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    private func handleBackgroundProcessingTask(_ task: BGProcessingTask) {
+        let work = Task { @MainActor [weak self] in
+            guard let self else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            await self.restoreExpiredFeaturesIfNeeded()
+            self.scheduleNextBackgroundProcessingTask()
+            task.setTaskCompleted(success: !Task.isCancelled)
+        }
+
+        task.expirationHandler = {
+            work.cancel()
+        }
+    }
+
+    private func operationKey(_ record: HMOnlineActiveRecord) -> String {
+        "\(record.gameKey):\(record.featureID)"
+    }
+
+    private func keyExpiryDate(_ raw: String) -> Date? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+
+        let normal = ISO8601DateFormatter()
+        if let date = normal.date(from: value) { return date }
+
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: value)
+    }
+
+    private func readActiveRecords() -> [HMOnlineActiveRecord] {
+        guard let data = UserDefaults.standard.data(forKey: activeKey),
+              let records = try? JSONDecoder().decode([HMOnlineActiveRecord].self, from: data) else {
+            return []
+        }
+        return records
+    }
+
+    private func persistActiveRecords(_ records: [HMOnlineActiveRecord]) {
+        if let data = try? JSONEncoder().encode(records) {
+            UserDefaults.standard.set(data, forKey: activeKey)
+        }
+    }
+
+    private func readKeyInfo() -> [String: FFKeyAccessInfo] {
+        guard let data = UserDefaults.standard.data(forKey: keyInfoKey),
+              let info = try? JSONDecoder().decode([String: FFKeyAccessInfo].self, from: data) else {
+            return [:]
+        }
+        return info
+    }
+
+    private func persistKeyInfo(_ info: [String: FFKeyAccessInfo]) {
+        if let data = try? JSONEncoder().encode(info) {
+            UserDefaults.standard.set(data, forKey: keyInfoKey)
+        }
+    }
+}
+
 struct HMOnlineKeyPrompt: Identifiable, Hashable {
     let feature: FFRemoteFeature
     let game: HMOnlineGame
@@ -331,6 +572,11 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
 
     init(game: HMOnlineGame) {
         self.game = game
+        activeRecords = Self.readActiveRecords()
+        keyAccessInfo = Self.readKeyInfo()
+    }
+
+    func syncPersistedExpiryState() {
         activeRecords = Self.readActiveRecords()
         keyAccessInfo = Self.readKeyInfo()
     }
@@ -655,6 +901,7 @@ struct HMOnlineGameFeaturesView: View {
         }
         .onChange(of: scenePhase) { phase in
             if phase == .active {
+                model.syncPersistedExpiryState()
                 startExpiryWatcher()
             } else {
                 expiryWatchTask?.cancel()
@@ -676,6 +923,10 @@ struct HMOnlineGameFeaturesView: View {
                 await MainActor.run { withAnimation(.easeOut(duration: 0.2)) { model.notice = nil } }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .hmOnlineExpiryStateDidChange)) { _ in
+            model.syncPersistedExpiryState()
+            if scenePhase == .active { startExpiryWatcher() }
+        }
         .onDisappear {
             noticeDismissTask?.cancel()
             expiryWatchTask?.cancel()
@@ -685,12 +936,13 @@ struct HMOnlineGameFeaturesView: View {
 
     private func startExpiryWatcher() {
         expiryWatchTask?.cancel()
-        expiryWatchTask = Task {
+        expiryWatchTask = Task { @MainActor in
             while !Task.isCancelled {
-                await model.restoreExpiredFeaturesIfNeeded()
+                await HMOnlineExpiryCoordinator.shared.restoreExpiredFeaturesIfNeeded()
+                model.syncPersistedExpiryState()
                 guard !Task.isCancelled else { return }
 
-                let delay = await MainActor.run { model.nextExpiryDelay() }
+                let delay = model.nextExpiryDelay()
                 let seconds = min(max(delay ?? 60, 0.25), 60)
                 let nanos = UInt64(seconds * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanos)
