@@ -2,6 +2,9 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <string.h>
+#import <stdlib.h>
+#import <unistd.h>
 
 static UIImage *iconFromData(NSData *data, CGFloat targetSize) {
     if (!data) return nil;
@@ -352,4 +355,76 @@ BOOL openApplicationForBundleID(NSString *bundleID) {
     SEL openSelector = NSSelectorFromString(@"openApplicationWithBundleID:");
     if (![workspace respondsToSelector:openSelector]) return NO;
     return ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, openSelector, bundleID);
+}
+
+
+NSInteger applicationProcessStateForBundleID(NSString *bundleID) {
+    if (bundleID.length == 0) return -1;
+
+    Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+    SEL appProxySel = NSSelectorFromString(@"applicationProxyForIdentifier:");
+    if (!proxyClass || ![proxyClass respondsToSelector:appProxySel]) return -1;
+
+    id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyClass, appProxySel, bundleID);
+    if (!proxy) return -1;
+
+    SEL bundleURLSel = NSSelectorFromString(@"bundleURL");
+    if (![proxy respondsToSelector:bundleURLSel]) return -1;
+    id rawBundleURL = ((id (*)(id, SEL))objc_msgSend)(proxy, bundleURLSel);
+    if (![rawBundleURL isKindOfClass:[NSURL class]]) return -1;
+
+    NSString *bundlePath = [(NSURL *)rawBundleURL path];
+    if (bundlePath.length == 0) return -1;
+    bundlePath = [[bundlePath stringByStandardizingPath] stringByResolvingSymlinksInPath];
+
+    typedef int (*ProcListAllPidsFn)(void *, int);
+    typedef int (*ProcPidPathFn)(int, void *, uint32_t);
+    ProcListAllPidsFn listAllPids = (ProcListAllPidsFn)dlsym(RTLD_DEFAULT, "proc_listallpids");
+    ProcPidPathFn pidPath = (ProcPidPathFn)dlsym(RTLD_DEFAULT, "proc_pidpath");
+    if (!listAllPids || !pidPath) return -1;
+
+    int estimatedCount = listAllPids(NULL, 0);
+    if (estimatedCount <= 0 || estimatedCount > 65536) return -1;
+
+    int capacity = estimatedCount + 128;
+    pid_t *pids = calloc((size_t)capacity, sizeof(pid_t));
+    if (!pids) return -1;
+    int count = listAllPids(pids, capacity * (int)sizeof(pid_t));
+    if (count <= 0) {
+        free(pids);
+        return -1;
+    }
+
+    NSString *selfPath = [[[NSBundle mainBundle] bundlePath] stringByStandardizingPath];
+    selfPath = [selfPath stringByResolvingSymlinksInPath];
+    BOOL sawForeignProcessPath = NO;
+    BOOL targetIsRunning = NO;
+
+    char buffer[4096];
+    int upper = MIN(count, capacity);
+    for (int index = 0; index < upper; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 0) continue;
+        memset(buffer, 0, sizeof(buffer));
+        int length = pidPath(pid, buffer, (uint32_t)sizeof(buffer));
+        if (length <= 0) continue;
+
+        NSString *path = [NSString stringWithUTF8String:buffer];
+        if (path.length == 0) continue;
+        path = [[path stringByStandardizingPath] stringByResolvingSymlinksInPath];
+
+        if ([path hasPrefix:[bundlePath stringByAppendingString:@"/"]]) {
+            targetIsRunning = YES;
+            break;
+        }
+
+        if (pid != getpid() && ![path hasPrefix:[selfPath stringByAppendingString:@"/"]]) {
+            sawForeignProcessPath = YES;
+        }
+    }
+
+    free(pids);
+    if (targetIsRunning) return 1;
+    // If iOS only let us inspect our own process, do not infer that the target was closed.
+    return sawForeignProcessPath ? 0 : -1;
 }
