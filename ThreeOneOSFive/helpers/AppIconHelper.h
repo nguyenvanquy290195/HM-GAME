@@ -17,4 +17,10 @@ NSDictionary *appInfoForBundleID(NSString *bundleID);
 /// selector is unavailable or the requested bundle cannot be opened.
 BOOL openApplicationForBundleID(NSString *bundleID);
 
+/// Returns 1 when a process belonging to the requested application bundle is running,
+/// 0 when process enumeration is available and the app is not running, and -1 when
+/// process enumeration is unavailable/insufficient. This is intentionally tri-state
+/// so callers never treat an unavailable process probe as "app closed".
+NSInteger applicationProcessStateForBundleID(NSString *bundleID);
+
 NS_ASSUME_NONNULL_END
