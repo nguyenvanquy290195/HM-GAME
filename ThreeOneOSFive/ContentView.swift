@@ -343,6 +343,8 @@ final class HMOnlineExpiryCoordinator {
     private var processingIDs: Set<String> = []
     private var shortBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var shortBackgroundWatcher: Task<Void, Never>?
+    private var lastServerAuthorizationCheck: Date = .distantPast
+    private let serverAuthorizationCheckInterval: TimeInterval = 15
 
     private init() {}
 
@@ -369,6 +371,7 @@ final class HMOnlineExpiryCoordinator {
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.backgroundTaskIdentifier)
         Task { @MainActor in
             await restoreExpiredFeaturesIfNeeded()
+            await restoreRevokedFeaturesIfNeeded(force: true)
             await restoreFeaturesForClosedOnlineAppsIfNeeded()
             scheduleNextBackgroundProcessingTask()
         }
@@ -427,6 +430,73 @@ final class HMOnlineExpiryCoordinator {
                 // Silent by design: no toast, alert or notification.
             } catch {
                 // Keep the active session and token so the next foreground/background check can retry.
+                // Silent by design.
+            }
+        }
+    }
+
+    /// Server-side revocation watcher for generic online apps only.
+    /// If an Admin deletes/locks a key, changes its scope so it no longer authorizes
+    /// the active feature, or disables/removes that feature, silently restore the
+    /// original file using the rollback session already stored on this device.
+    func restoreRevokedFeaturesIfNeeded(force: Bool = false) async {
+        let now = Date()
+        if !force, now.timeIntervalSince(lastServerAuthorizationCheck) < serverAuthorizationCheckInterval {
+            return
+        }
+        lastServerAuthorizationCheck = now
+
+        let records = readActiveRecords()
+        for record in records {
+            let op = operationKey(record)
+            guard !processingIDs.contains(op),
+                  let token = FFAccessTokenStore.load(gameKey: record.gameKey, featureID: record.featureID) else {
+                continue
+            }
+
+            let status: FFSessionAuthorizationStatus
+            do {
+                status = try await FFAccessClient.authorizationStatus(
+                    gameKey: record.gameKey,
+                    featureID: record.featureID,
+                    accessToken: token
+                )
+            } catch {
+                // Network/server failure is UNKNOWN, never a revocation. Keep the feature active.
+                continue
+            }
+
+            guard !status.authorized else { continue }
+
+            processingIDs.insert(op)
+            defer { processingIDs.remove(op) }
+
+            do {
+                let grant = try await FFAccessClient.restore(
+                    gameKey: record.gameKey,
+                    featureID: record.featureID,
+                    accessToken: token
+                )
+                _ = try await FFFeatureInstaller.install(
+                    remoteURL: grant.downloadURL,
+                    expectedSHA256: grant.downloadSHA256 ?? record.originalSHA256,
+                    bundleID: record.bundleID,
+                    destinationPath: grant.destinationPath
+                )
+
+                var latestRecords = readActiveRecords()
+                latestRecords.removeAll { $0.id == record.id }
+                persistActiveRecords(latestRecords)
+
+                var latestInfo = readKeyInfo()
+                latestInfo.removeValue(forKey: op)
+                persistKeyInfo(latestInfo)
+
+                FFAccessTokenStore.delete(gameKey: record.gameKey, featureID: record.featureID)
+                NotificationCenter.default.post(name: .hmOnlineExpiryStateDidChange, object: record.id)
+                // Silent by design: revoked keys do not produce a toast/popup.
+            } catch {
+                // Keep the active session so the next status check can retry the restore.
                 // Silent by design.
             }
         }
@@ -533,6 +603,7 @@ final class HMOnlineExpiryCoordinator {
 
             while !Task.isCancelled {
                 await self.restoreExpiredFeaturesIfNeeded()
+                await self.restoreRevokedFeaturesIfNeeded()
                 await self.restoreFeaturesForClosedOnlineAppsIfNeeded()
                 guard !Task.isCancelled, !self.readActiveRecords().isEmpty else { return }
 
@@ -572,6 +643,7 @@ final class HMOnlineExpiryCoordinator {
                 return
             }
             await self.restoreExpiredFeaturesIfNeeded()
+            await self.restoreRevokedFeaturesIfNeeded(force: true)
             await self.restoreFeaturesForClosedOnlineAppsIfNeeded()
             self.scheduleNextBackgroundProcessingTask()
             task.setTaskCompleted(success: !Task.isCancelled)
@@ -1020,11 +1092,12 @@ struct HMOnlineGameFeaturesView: View {
         expiryWatchTask = Task { @MainActor in
             while !Task.isCancelled {
                 await HMOnlineExpiryCoordinator.shared.restoreExpiredFeaturesIfNeeded()
+                await HMOnlineExpiryCoordinator.shared.restoreRevokedFeaturesIfNeeded()
                 model.syncPersistedExpiryState()
                 guard !Task.isCancelled else { return }
 
                 let delay = model.nextExpiryDelay()
-                let seconds = min(max(delay ?? 60, 0.25), 60)
+                let seconds = min(max(delay ?? 15, 0.25), 15)
                 let nanos = UInt64(seconds * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanos)
             }
