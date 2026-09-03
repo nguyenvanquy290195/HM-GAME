@@ -337,6 +337,7 @@ final class HMOnlineExpiryCoordinator {
 
     private let activeKey = "hmGaming.onlineGameActiveRecords.v1"
     private let keyInfoKey = "hmGaming.onlineGameKeyInfo.v1"
+    private let seenRunningBundlesKey = "hmGaming.onlineGameSeenRunningBundles.v1"
 
     private var registeredBackgroundTask = false
     private var processingIDs: Set<String> = []
@@ -368,6 +369,8 @@ final class HMOnlineExpiryCoordinator {
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.backgroundTaskIdentifier)
         Task { @MainActor in
             await restoreExpiredFeaturesIfNeeded()
+            await restoreFeaturesForClosedOnlineAppsIfNeeded()
+            scheduleNextBackgroundProcessingTask()
         }
     }
 
@@ -429,6 +432,82 @@ final class HMOnlineExpiryCoordinator {
         }
     }
 
+    /// Close-watch applies only to the generic online-app record store. The built-in
+    /// Free Fire / Free Fire MAX pages use FFActiveRecord and therefore never enter here.
+    /// A bundle must first be observed running. Only a later trusted `not running` probe
+    /// can trigger restore, preventing a missing process API from causing false disables.
+    func restoreFeaturesForClosedOnlineAppsIfNeeded() async {
+        var records = readActiveRecords()
+        guard !records.isEmpty else {
+            persistSeenRunningBundles([])
+            return
+        }
+
+        let activeBundles = Set(records.map(\.bundleID))
+        var seenRunning = readSeenRunningBundles().intersection(activeBundles)
+
+        for bundleID in activeBundles {
+            let state = applicationProcessStateForBundleID(bundleID)
+            if state == 1 {
+                seenRunning.insert(bundleID)
+                continue
+            }
+            // -1 means the process probe was unavailable. Never interpret it as closed.
+            guard state == 0, seenRunning.contains(bundleID) else { continue }
+
+            let bundleRecords = records.filter { $0.bundleID == bundleID }
+            for record in bundleRecords {
+                let op = operationKey(record)
+                guard !processingIDs.contains(op),
+                      let token = FFAccessTokenStore.load(gameKey: record.gameKey, featureID: record.featureID) else {
+                    continue
+                }
+
+                processingIDs.insert(op)
+                defer { processingIDs.remove(op) }
+                do {
+                    let grant = try await FFAccessClient.restore(
+                        gameKey: record.gameKey,
+                        featureID: record.featureID,
+                        accessToken: token
+                    )
+                    _ = try await FFFeatureInstaller.install(
+                        remoteURL: grant.downloadURL,
+                        expectedSHA256: grant.downloadSHA256 ?? record.originalSHA256,
+                        bundleID: record.bundleID,
+                        destinationPath: grant.destinationPath
+                    )
+
+                    var latestRecords = readActiveRecords()
+                    latestRecords.removeAll { $0.id == record.id }
+                    persistActiveRecords(latestRecords)
+                    records = latestRecords
+                    NotificationCenter.default.post(name: .hmOnlineExpiryStateDidChange, object: record.id)
+                    // Deliberately keep the still-valid key token/access info, matching manual OFF.
+                    // Silent by design: no toast, alert or notification.
+                } catch {
+                    // Keep the active record + seen-running marker so a later check can retry.
+                    // Silent by design.
+                }
+            }
+
+            if !records.contains(where: { $0.bundleID == bundleID }) {
+                seenRunning.remove(bundleID)
+            }
+        }
+
+        seenRunning.formIntersection(Set(readActiveRecords().map(\.bundleID)))
+        persistSeenRunningBundles(seenRunning)
+    }
+
+    private func readSeenRunningBundles() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: seenRunningBundlesKey) ?? [])
+    }
+
+    private func persistSeenRunningBundles(_ bundles: Set<String>) {
+        UserDefaults.standard.set(Array(bundles).sorted(), forKey: seenRunningBundlesKey)
+    }
+
     func nextExpiryDate() -> Date? {
         let records = readActiveRecords()
         let activeIDs = Set(records.map { operationKey($0) })
@@ -454,12 +533,12 @@ final class HMOnlineExpiryCoordinator {
 
             while !Task.isCancelled {
                 await self.restoreExpiredFeaturesIfNeeded()
-                guard !Task.isCancelled else { return }
+                await self.restoreFeaturesForClosedOnlineAppsIfNeeded()
+                guard !Task.isCancelled, !self.readActiveRecords().isEmpty else { return }
 
-                guard let next = self.nextExpiryDate() else { return }
-                let remaining = next.timeIntervalSinceNow
-                let seconds = min(max(remaining, 0.25), 12.0)
-                let nanos = UInt64(seconds * 1_000_000_000)
+                let expiryDelay = self.nextExpiryDate().map { max(0.25, $0.timeIntervalSinceNow) } ?? 3.0
+                let seconds = min(expiryDelay, 3.0)
+                let nanos = UInt64(max(seconds, 0.25) * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanos)
             }
         }
@@ -476,12 +555,13 @@ final class HMOnlineExpiryCoordinator {
 
     private func scheduleNextBackgroundProcessingTask() {
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.backgroundTaskIdentifier)
-        guard let next = nextExpiryDate() else { return }
+        guard !readActiveRecords().isEmpty else { return }
 
         let request = BGProcessingTaskRequest(identifier: Self.backgroundTaskIdentifier)
         request.requiresNetworkConnectivity = true
         request.requiresExternalPower = false
-        request.earliestBeginDate = max(next, Date().addingTimeInterval(1))
+        let closeCheckFallback = Date().addingTimeInterval(15 * 60)
+        request.earliestBeginDate = nextExpiryDate().map { min(max($0, Date().addingTimeInterval(1)), closeCheckFallback) } ?? closeCheckFallback
         try? BGTaskScheduler.shared.submit(request)
     }
 
@@ -492,6 +572,7 @@ final class HMOnlineExpiryCoordinator {
                 return
             }
             await self.restoreExpiredFeaturesIfNeeded()
+            await self.restoreFeaturesForClosedOnlineAppsIfNeeded()
             self.scheduleNextBackgroundProcessingTask()
             task.setTaskCompleted(success: !Task.isCancelled)
         }
