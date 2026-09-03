@@ -128,6 +128,18 @@ struct FFAccessGrant: Decodable {
     }
 }
 
+struct FFSessionAuthorizationStatus: Decodable {
+    let ok: Bool
+    let authorized: Bool
+    let reason: String?
+    let keyExpiresAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, authorized, reason
+        case keyExpiresAt = "key_expires_at"
+    }
+}
+
 struct FFKeyAccessInfo: Codable, Hashable {
     let expiresAt: String
     let maxDevices: Int
@@ -523,6 +535,40 @@ enum FFAccessClient {
             "build_id": HMBuildIdentity.id,
             "access_token": accessToken
         ])
+    }
+
+    static func authorizationStatus(
+        gameKey: String,
+        featureID: String,
+        accessToken: String
+    ) async throws -> FFSessionAuthorizationStatus {
+        guard let url = URL(string: accessURL) else { throw FFFeatureError.invalidServerURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "action": "status",
+            "game": gameKey,
+            "feature_id": featureID,
+            "device_id": FFDeviceIdentity.value,
+            "build_id": HMBuildIdentity.id,
+            "access_token": accessToken
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw FFFeatureError.invalidResponse }
+        guard (200...299).contains(http.statusCode) else {
+            if let payload = try? JSONDecoder().decode(FFServerErrorPayload.self, from: data) {
+                throw FFServerAccessError(
+                    code: payload.code ?? "server_error",
+                    message: payload.message ?? "Máy chủ từ chối yêu cầu."
+                )
+            }
+            throw FFFeatureError.serverStatus(http.statusCode)
+        }
+        return try JSONDecoder().decode(FFSessionAuthorizationStatus.self, from: data)
     }
 
     private static func request(_ body: [String: Any]) async throws -> FFAccessGrant {
