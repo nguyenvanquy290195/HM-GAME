@@ -203,6 +203,7 @@ struct ThreeOneOSFiveApp: App {
 
     init() {
         setupLogCapture()
+        HMOnlineExpiryCoordinator.shared.registerBackgroundTask()
         log("app: HM GAMING launching — build \(HMBuildIdentity.id) — iOS \(AppInfo.osVersion) (\(AppInfo.osBuild)) \(AppInfo.machineName)")
     }
 
