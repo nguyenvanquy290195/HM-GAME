@@ -324,7 +324,7 @@ struct HMOnlineActiveRecord: Codable, Identifiable, Hashable {
 }
 
 
-// MARK: - Online app key expiry coordinator
+// MARK: - Online app server authorization / automatic restore coordinator
 
 extension Notification.Name {
     static let hmOnlineExpiryStateDidChange = Notification.Name("hmGaming.onlineExpiryStateDidChange")
@@ -370,7 +370,7 @@ final class HMOnlineExpiryCoordinator {
         stopShortBackgroundWatcher()
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.backgroundTaskIdentifier)
         Task { @MainActor in
-            await restoreExpiredFeaturesIfNeeded()
+            // Server is the source of truth for deleted, disabled AND expired keys.
             await restoreRevokedFeaturesIfNeeded(force: true)
             await restoreFeaturesForClosedOnlineAppsIfNeeded()
             scheduleNextBackgroundProcessingTask()
@@ -378,67 +378,18 @@ final class HMOnlineExpiryCoordinator {
     }
 
     /// Layer 2: when HM GAMING enters multitasking/background, use the remaining execution window
-    /// and also ask iOS for a BGProcessing wake-up near the next key expiry.
+    /// and ask iOS for a BGProcessing wake-up. The stored expiry is only a scheduling hint;
+    /// the server still confirms authorization before any restore.
     func sceneDidEnterBackground() {
         scheduleNextBackgroundProcessingTask()
         startShortBackgroundWatcher()
     }
 
-    func restoreExpiredFeaturesIfNeeded() async {
-        let now = Date()
-        let records = readActiveRecords()
-        let info = readKeyInfo()
 
-        for record in records {
-            let op = operationKey(record)
-            guard !processingIDs.contains(op),
-                  let keyInfo = info[op],
-                  let expiry = keyExpiryDate(keyInfo.expiresAt),
-                  expiry <= now,
-                  let token = FFAccessTokenStore.load(gameKey: record.gameKey, featureID: record.featureID) else {
-                continue
-            }
-
-            processingIDs.insert(op)
-            defer { processingIDs.remove(op) }
-
-            do {
-                let grant = try await FFAccessClient.restore(
-                    gameKey: record.gameKey,
-                    featureID: record.featureID,
-                    accessToken: token
-                )
-                _ = try await FFFeatureInstaller.install(
-                    remoteURL: grant.downloadURL,
-                    expectedSHA256: grant.downloadSHA256 ?? record.originalSHA256,
-                    bundleID: record.bundleID,
-                    destinationPath: grant.destinationPath
-                )
-
-                // Re-read before mutating so a feature enabled while the network request was running
-                // is not accidentally overwritten by stale UserDefaults data.
-                var latestRecords = readActiveRecords()
-                latestRecords.removeAll { $0.id == record.id }
-                persistActiveRecords(latestRecords)
-
-                var latestInfo = readKeyInfo()
-                latestInfo.removeValue(forKey: op)
-                persistKeyInfo(latestInfo)
-
-                FFAccessTokenStore.delete(gameKey: record.gameKey, featureID: record.featureID)
-                NotificationCenter.default.post(name: .hmOnlineExpiryStateDidChange, object: record.id)
-                // Silent by design: no toast, alert or notification.
-            } catch {
-                // Keep the active session and token so the next foreground/background check can retry.
-                // Silent by design.
-            }
-        }
-    }
-
-    /// Server-side revocation watcher for generic online apps only.
-    /// If an Admin deletes/locks a key, changes its scope so it no longer authorizes
-    /// the active feature, or disables/removes that feature, silently restore the
-    /// original file using the rollback session already stored on this device.
+    /// Server authorization watcher for generic online apps only.
+    /// This is the single source of truth for automatic shutdown: deleted, locked,
+    /// expired, scope-revoked keys, or disabled/removed features all return
+    /// authorized=false. Only then do we silently restore the original file.
     func restoreRevokedFeaturesIfNeeded(force: Bool = false) async {
         let now = Date()
         if !force, now.timeIntervalSince(lastServerAuthorizationCheck) < serverAuthorizationCheckInterval {
@@ -602,7 +553,6 @@ final class HMOnlineExpiryCoordinator {
             defer { self.stopShortBackgroundWatcher() }
 
             while !Task.isCancelled {
-                await self.restoreExpiredFeaturesIfNeeded()
                 await self.restoreRevokedFeaturesIfNeeded()
                 await self.restoreFeaturesForClosedOnlineAppsIfNeeded()
                 guard !Task.isCancelled, !self.readActiveRecords().isEmpty else { return }
@@ -642,7 +592,6 @@ final class HMOnlineExpiryCoordinator {
                 task.setTaskCompleted(success: false)
                 return
             }
-            await self.restoreExpiredFeaturesIfNeeded()
             await self.restoreRevokedFeaturesIfNeeded(force: true)
             await self.restoreFeaturesForClosedOnlineAppsIfNeeded()
             self.scheduleNextBackgroundProcessingTask()
@@ -907,59 +856,6 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
         persistActiveRecords()
     }
 
-    func restoreExpiredFeaturesIfNeeded() async {
-        let now = Date()
-        let records = activeRecords.filter { $0.gameKey == game.id }
-
-        for record in records {
-            let op = operationKey(record.featureID)
-            guard !busyIDs.contains(op),
-                  let info = keyAccessInfo[op],
-                  let expiry = keyExpiryDate(info.expiresAt),
-                  expiry <= now else { continue }
-
-            guard let token = FFAccessTokenStore.load(gameKey: game.id, featureID: record.featureID) else {
-                continue
-            }
-
-            busyIDs.insert(op)
-            do {
-                try await performRestore(record, token: token)
-                FFAccessTokenStore.delete(gameKey: game.id, featureID: record.featureID)
-                keyAccessInfo.removeValue(forKey: op)
-                persistKeyInfo()
-                // Key hết hạn: tự tắt im lặng, không hiển thị toast/popup.
-            } catch {
-                // Giữ phiên đang hoạt động để thử khôi phục lại ở lần kiểm tra tiếp theo.
-                // Không hiển thị thông báo khi quá trình tự tắt do hết hạn thất bại.
-            }
-            busyIDs.remove(op)
-        }
-    }
-
-    func nextExpiryDelay() -> TimeInterval? {
-        let now = Date()
-        let activeIDs = Set(activeRecords.filter { $0.gameKey == game.id }.map(\.featureID))
-        let expiries = activeIDs.compactMap { featureID -> Date? in
-            guard let info = keyAccessInfo[operationKey(featureID)] else { return nil }
-            return keyExpiryDate(info.expiresAt)
-        }.filter { $0 > now }
-
-        guard let next = expiries.min() else { return nil }
-        return max(0.25, next.timeIntervalSince(now))
-    }
-
-    private func keyExpiryDate(_ raw: String) -> Date? {
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return nil }
-
-        let normal = ISO8601DateFormatter()
-        if let date = normal.date(from: value) { return date }
-
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: value)
-    }
 
     func keyStatusText(_ feature: FFRemoteFeature) -> String? {
         guard let info = keyAccessInfo[operationKey(feature.id)] else { return nil }
@@ -1091,15 +987,13 @@ struct HMOnlineGameFeaturesView: View {
         expiryWatchTask?.cancel()
         expiryWatchTask = Task { @MainActor in
             while !Task.isCancelled {
-                await HMOnlineExpiryCoordinator.shared.restoreExpiredFeaturesIfNeeded()
+                // Expiry/revocation is confirmed by the server; the device clock never
+                // decides to restore a feature on its own.
                 await HMOnlineExpiryCoordinator.shared.restoreRevokedFeaturesIfNeeded()
                 model.syncPersistedExpiryState()
                 guard !Task.isCancelled else { return }
 
-                let delay = model.nextExpiryDelay()
-                let seconds = min(max(delay ?? 15, 0.25), 15)
-                let nanos = UInt64(seconds * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
             }
         }
     }
