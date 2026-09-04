@@ -743,8 +743,8 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
     func isGameAuthorized() -> Bool { gameAccessStates[game.id] != nil }
 
     func isFeatureAuthorized(_ feature: FFRemoteFeature) -> Bool {
-        guard let state = gameAccessStates[game.id] else { return false }
-        return state.allowedFeatureIDs.contains(feature.id)
+        // Sau khi nhập key của ứng dụng, mọi feature của ứng dụng dùng chung phiên đó.
+        isGameAuthorized()
     }
 
     func promptForGameKeyIfNeeded() {
@@ -761,6 +761,11 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
         guard !value.isEmpty else { return "Vui lòng nhập key." }
         do {
             let grant = try await FFAccessClient.login(gameKey: prompt.gameKey, key: value)
+            guard let gameSessionToken = grant.accessTokens.values.first(where: { !$0.isEmpty }) else {
+                return "Máy chủ không cấp được phiên key cho ứng dụng."
+            }
+            FFAccessTokenStore.storeGameSession(gameSessionToken, gameKey: prompt.gameKey)
+
             if let previous = gameAccessStates[prompt.gameKey] {
                 for fid in previous.allowedFeatureIDs {
                     let isStillNeededForRestore = activeRecords.contains { $0.gameKey == prompt.gameKey && $0.featureID == fid }
@@ -808,6 +813,7 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
                 }
             }
         }
+        FFAccessTokenStore.deleteGameSession(gameKey: game.id)
         gameAccessStates.removeValue(forKey: game.id)
         FFGameAccessStore.saveAll(gameAccessStates)
         persistKeyInfo()
@@ -818,11 +824,11 @@ final class HMOnlineGameFeatureViewModel: ObservableObject {
         guard !busyIDs.contains(op) else { return }
         if enabled {
             guard feature.enabled else { notice = "Chức năng đang bị tắt trên máy chủ."; return }
-            guard isGameAuthorized(), isFeatureAuthorized(feature) else {
+            guard isGameAuthorized() else {
                 gameKeyPrompt = FFGameKeyPrompt(gameKey: game.id, gameName: game.name)
                 return
             }
-            guard let token = FFAccessTokenStore.load(gameKey: game.id, featureID: feature.id) else {
+            guard let token = FFAccessTokenStore.loadGameSession(gameKey: game.id) else {
                 clearGameAuthorization()
                 gameKeyPrompt = FFGameKeyPrompt(gameKey: game.id, gameName: game.name)
                 return
