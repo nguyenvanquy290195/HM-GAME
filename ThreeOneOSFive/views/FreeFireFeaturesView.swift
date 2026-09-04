@@ -497,6 +497,32 @@ enum FFAccessTokenStore {
     static func delete(game: FFGameKind, featureID: String) {
         delete(gameKey: game.rawValue, featureID: featureID)
     }
+
+    private static let gameSessionFeatureID = "__GAME_SESSION__"
+
+    static func storeGameSession(_ token: String, gameKey: String) {
+        store(token, gameKey: gameKey, featureID: gameSessionFeatureID)
+    }
+
+    static func storeGameSession(_ token: String, game: FFGameKind) {
+        storeGameSession(token, gameKey: game.rawValue)
+    }
+
+    static func loadGameSession(gameKey: String) -> String? {
+        load(gameKey: gameKey, featureID: gameSessionFeatureID)
+    }
+
+    static func loadGameSession(game: FFGameKind) -> String? {
+        loadGameSession(gameKey: game.rawValue)
+    }
+
+    static func deleteGameSession(gameKey: String) {
+        delete(gameKey: gameKey, featureID: gameSessionFeatureID)
+    }
+
+    static func deleteGameSession(game: FFGameKind) {
+        deleteGameSession(gameKey: game.rawValue)
+    }
 }
 
 enum FFDeviceIdentity {
@@ -778,9 +804,8 @@ final class FreeFireFeatureViewModel: ObservableObject {
     }
 
     func isFeatureAuthorized(_ feature: FFRemoteFeature, game: FFGameKind? = nil) -> Bool {
-        let resolved = game ?? selectedGame
-        guard let state = gameAccessStates[resolved.rawValue] else { return false }
-        return state.allowedFeatureIDs.contains(feature.id)
+        // Key được xác thực theo ứng dụng/game, không theo từng feature nữa.
+        isGameAuthorized(game)
     }
 
     func promptForGameKeyIfNeeded(_ game: FFGameKind? = nil) {
@@ -799,6 +824,11 @@ final class FreeFireFeatureViewModel: ObservableObject {
         guard !trimmed.isEmpty else { return "Vui lòng nhập key." }
         do {
             let grant = try await FFAccessClient.login(gameKey: prompt.gameKey, key: trimmed)
+            guard let gameSessionToken = grant.accessTokens.values.first(where: { !$0.isEmpty }) else {
+                return "Máy chủ không cấp được phiên key cho ứng dụng."
+            }
+            FFAccessTokenStore.storeGameSession(gameSessionToken, gameKey: prompt.gameKey)
+
             let previous = gameAccessStates[prompt.gameKey]
             let previousGame = FFGameKind(rawValue: prompt.gameKey)
             for fid in previous?.allowedFeatureIDs ?? [] {
@@ -849,6 +879,7 @@ final class FreeFireFeatureViewModel: ObservableObject {
                 }
             }
         }
+        FFAccessTokenStore.deleteGameSession(game: game)
         gameAccessStates.removeValue(forKey: game.rawValue)
         FFGameAccessStore.saveAll(gameAccessStates)
         persistKeyAccessInfo()
@@ -864,11 +895,11 @@ final class FreeFireFeatureViewModel: ObservableObject {
                 notice = "Chức năng này đang bị tắt trên máy chủ."
                 return
             }
-            guard isGameAuthorized(game), isFeatureAuthorized(feature, game: game) else {
+            guard isGameAuthorized(game) else {
                 gameKeyPrompt = FFGameKeyPrompt(gameKey: game.rawValue, gameName: game.title)
                 return
             }
-            guard let token = FFAccessTokenStore.load(game: game, featureID: feature.id) else {
+            guard let token = FFAccessTokenStore.loadGameSession(game: game) else {
                 clearGameAuthorization(game)
                 gameKeyPrompt = FFGameKeyPrompt(gameKey: game.rawValue, gameName: game.title)
                 return
