@@ -75,10 +75,17 @@ struct FFRemoteGame: Decodable {
     }
 }
 
+struct FFRemoteFile: Decodable, Hashable {
+    let name: String
+    let sha256: String?
+}
+
 struct FFRemoteFeature: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
     let category: String?
+    let installMode: String?
+    let files: [FFRemoteFile]?
     let note: String?
     let enabled: Bool
     let destinationPath: String
@@ -88,7 +95,8 @@ struct FFRemoteFeature: Decodable, Identifiable, Hashable {
     let updatedAt: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, category, note, enabled
+        case id, name, category, files, note, enabled
+        case installMode = "install_mode"
         case destinationPath = "destination_path"
         case activeSHA256 = "active_sha256"
         case originalSHA256 = "original_sha256"
@@ -107,29 +115,53 @@ struct FFActiveRecord: Codable, Identifiable, Hashable {
     var id: String { "\(game.rawValue):\(featureID)" }
 }
 
-struct FFAccessGrant: Decodable {
-    let ok: Bool
-    let accessToken: String?
+struct FFAccessFile: Decodable, Hashable {
+    let name: String?
     let downloadURL: String
     let downloadSHA256: String?
     let expiresIn: Int?
     let destinationPath: String
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case downloadURL = "download_url"
+        case downloadSHA256 = "download_sha256"
+        case expiresIn = "expires_in"
+        case destinationPath = "destination_path"
+    }
+}
+
+struct FFAccessGrant: Decodable {
+    let ok: Bool
+    let accessToken: String?
+    let installMode: String?
+    let restoreMode: String?
+    let downloadURL: String?
+    let downloadSHA256: String?
+    let expiresIn: Int?
+    let destinationPath: String?
+    let files: [FFAccessFile]?
+    let deletePaths: [String]?
     let keyExpiresAt: String?
     let maxDevices: Int?
     let deviceCount: Int?
 
     enum CodingKeys: String, CodingKey {
-        case ok
+        case ok, files
         case accessToken = "access_token"
+        case installMode = "install_mode"
+        case restoreMode = "restore_mode"
         case downloadURL = "download_url"
         case downloadSHA256 = "download_sha256"
         case expiresIn = "expires_in"
         case destinationPath = "destination_path"
+        case deletePaths = "delete_paths"
         case keyExpiresAt = "key_expires_at"
         case maxDevices = "max_devices"
         case deviceCount = "device_count"
     }
 }
+
 
 struct FFSessionAuthorizationStatus: Decodable {
     let ok: Bool
@@ -264,13 +296,15 @@ enum FFFeatureInstaller {
         remoteURL: String,
         expectedSHA256: String?,
         game: FFGameKind,
-        destinationPath: String
+        destinationPath: String,
+        allowCreate: Bool = false
     ) async throws -> Int64 {
         try await install(
             remoteURL: remoteURL,
             expectedSHA256: expectedSHA256,
             bundleID: game.bundleID,
-            destinationPath: destinationPath
+            destinationPath: destinationPath,
+            allowCreate: allowCreate
         )
     }
 
@@ -278,7 +312,8 @@ enum FFFeatureInstaller {
         remoteURL: String,
         expectedSHA256: String?,
         bundleID: String,
-        destinationPath: String
+        destinationPath: String,
+        allowCreate: Bool = false
     ) async throws -> Int64 {
         guard let url = URL(string: remoteURL),
               url.scheme?.lowercased() == "https",
@@ -322,7 +357,6 @@ enum FFFeatureInstaller {
                         throw FFFeatureError.containerUnavailable(bundleID)
                     }
 
-                    // Mirror the Files tab access grant before attempting a write.
                     var activationError: NSString?
                     let mcmHandle = MCMActivateContainer(2, bundleID, false, &activationError)
                     if mcmHandle < 0 {
@@ -331,14 +365,34 @@ enum FFFeatureInstaller {
 
                     let targetURL = try validatedTargetURL(
                         containerPath: containerPath,
-                        relativePath: destinationPath
+                        relativePath: destinationPath,
+                        requireExisting: !allowCreate
                     )
 
-                    let result = try FileReplacementService.replace(
-                        target: targetURL,
-                        with: downloadedURL
-                    )
-                    continuation.resume(returning: result.byteCount)
+                    let fm = FileManager.default
+                    var createdPlaceholder = false
+                    if !fm.fileExists(atPath: targetURL.path) {
+                        guard allowCreate else {
+                            throw FFFeatureError.targetMissing(destinationPath)
+                        }
+                        guard fm.createFile(atPath: targetURL.path, contents: Data()) else {
+                            throw FFFeatureError.installFailed
+                        }
+                        createdPlaceholder = true
+                    }
+
+                    do {
+                        let result = try FileReplacementService.replace(
+                            target: targetURL,
+                            with: downloadedURL
+                        )
+                        continuation.resume(returning: result.byteCount)
+                    } catch {
+                        if createdPlaceholder {
+                            try? fm.removeItem(at: targetURL)
+                        }
+                        throw error
+                    }
                 } catch let error as FFFeatureError {
                     continuation.resume(throwing: error)
                 } catch let error as FileReplacementError {
@@ -359,9 +413,55 @@ enum FFFeatureInstaller {
         }
     }
 
+    static func delete(
+        game: FFGameKind,
+        relativePaths: [String]
+    ) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    guard let containerPath = ContainerStore.resolveAppContainerPath(bundleID: game.bundleID) else {
+                        throw FFFeatureError.containerUnavailable(game.bundleID)
+                    }
+
+                    var activationError: NSString?
+                    let mcmHandle = MCMActivateContainer(2, game.bundleID, false, &activationError)
+                    if mcmHandle < 0 {
+                        _ = ContainerStore.grantContainerAccess(containerPath)
+                    }
+
+                    let fm = FileManager.default
+                    for rawPath in relativePaths {
+                        let targetURL = try validatedTargetURL(
+                            containerPath: containerPath,
+                            relativePath: rawPath,
+                            requireExisting: false
+                        )
+                        guard fm.fileExists(atPath: targetURL.path) else { continue }
+
+                        let values = try targetURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                        if values.isSymbolicLink == true {
+                            throw FFFeatureError.symbolicLinkUnsupported
+                        }
+                        if values.isDirectory == true {
+                            throw FFFeatureError.targetIsDirectory
+                        }
+                        try fm.removeItem(at: targetURL)
+                    }
+                    continuation.resume()
+                } catch let error as FFFeatureError {
+                    continuation.resume(throwing: error)
+                } catch {
+                    continuation.resume(throwing: FFFeatureError.installFailed)
+                }
+            }
+        }
+    }
+
     private static func validatedTargetURL(
         containerPath: String,
         relativePath rawPath: String,
+        requireExisting: Bool,
         fileManager: FileManager = .default
     ) throws -> URL {
         let relativePath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -387,7 +487,6 @@ enum FFFeatureInstaller {
             throw FFFeatureError.invalidDestinationPath
         }
 
-        // Reject any existing symlink component so a server path cannot escape the game container.
         var cursor = rootURL
         for component in components {
             cursor.appendPathComponent(component)
@@ -400,11 +499,22 @@ enum FFFeatureInstaller {
         }
 
         var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: targetURL.path, isDirectory: &isDirectory) else {
+        if fileManager.fileExists(atPath: targetURL.path, isDirectory: &isDirectory) {
+            guard !isDirectory.boolValue else {
+                throw FFFeatureError.targetIsDirectory
+            }
+            return targetURL
+        }
+
+        guard !requireExisting else {
             throw FFFeatureError.targetMissing(relativePath)
         }
-        guard !isDirectory.boolValue else {
-            throw FFFeatureError.targetIsDirectory
+
+        let parentURL = targetURL.deletingLastPathComponent()
+        var parentIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: parentURL.path, isDirectory: &parentIsDirectory),
+              parentIsDirectory.boolValue else {
+            throw FFFeatureError.targetMissing(parentURL.path)
         }
         return targetURL
     }
@@ -417,6 +527,99 @@ enum FFFeatureInstaller {
             hasher.update(data: data)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+enum FFPatchLicenseError: Error, LocalizedError {
+    case logMissing
+    case emptyDeviceID
+    case cannotWriteLicense
+    case verificationFailed
+    case cannotDeleteLog
+    case containerUnavailable(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .logMissing:
+            return "Chưa thấy ffrts_log.txt. Hãy vào game và bấm AIM/ESP một lần trước."
+        case .emptyDeviceID:
+            return "ffrts_log.txt không có Device ID hợp lệ."
+        case .cannotWriteLicense:
+            return "Không thể tạo hama.lic trong Documents của game."
+        case .verificationFailed:
+            return "Đã ghi hama.lic nhưng kiểm tra lại không khớp."
+        case .cannotDeleteLog:
+            return "Đã tạo hama.lic nhưng không xóa được ffrts_log.txt."
+        case .containerUnavailable(let bundleID):
+            return "Không truy cập được data của \(bundleID)."
+        }
+    }
+}
+
+enum FFPatchLicenseService {
+    static func authorize(game: FFGameKind) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    guard let containerPath = ContainerStore.resolveAppContainerPath(bundleID: game.bundleID) else {
+                        throw FFPatchLicenseError.containerUnavailable(game.bundleID)
+                    }
+
+                    var activationError: NSString?
+                    let mcmHandle = MCMActivateContainer(2, game.bundleID, false, &activationError)
+                    if mcmHandle < 0 {
+                        _ = ContainerStore.grantContainerAccess(containerPath)
+                    }
+
+                    let documentsURL = URL(fileURLWithPath: containerPath, isDirectory: true)
+                        .appendingPathComponent("Documents", isDirectory: true)
+                    let logURL = documentsURL.appendingPathComponent("ffrts_log.txt", isDirectory: false)
+                    let licURL = documentsURL.appendingPathComponent("hama.lic", isDirectory: false)
+                    let fm = FileManager.default
+
+                    guard fm.fileExists(atPath: logURL.path) else {
+                        throw FFPatchLicenseError.logMissing
+                    }
+
+                    let rawID = try String(contentsOf: logURL, encoding: .utf8)
+                    let deviceID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !deviceID.isEmpty else {
+                        throw FFPatchLicenseError.emptyDeviceID
+                    }
+
+                    let formatter = DateFormatter()
+                    formatter.locale = Locale(identifier: "en_US_POSIX")
+                    formatter.calendar = Calendar(identifier: .gregorian)
+                    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+                    formatter.dateFormat = "yyyyMMdd"
+                    let day = formatter.string(from: Date())
+                    let license = "\(deviceID)|\(day)|HG5|9F27C1B8A4E63D52"
+
+                    do {
+                        try Data(license.utf8).write(to: licURL, options: .atomic)
+                    } catch {
+                        throw FFPatchLicenseError.cannotWriteLicense
+                    }
+
+                    guard let verify = try? String(contentsOf: licURL, encoding: .utf8),
+                          verify == license else {
+                        throw FFPatchLicenseError.verificationFailed
+                    }
+
+                    do {
+                        try fm.removeItem(at: logURL)
+                    } catch {
+                        throw FFPatchLicenseError.cannotDeleteLog
+                    }
+
+                    continuation.resume(returning: deviceID)
+                } catch let error as FFPatchLicenseError {
+                    continuation.resume(throwing: error)
+                } catch {
+                    continuation.resume(throwing: FFPatchLicenseError.cannotWriteLicense)
+                }
+            }
+        }
     }
 }
 
@@ -706,6 +909,7 @@ final class FreeFireFeatureViewModel: ObservableObject {
     @Published private(set) var keyAccessInfo: [String: FFKeyAccessInfo] = [:]
     @Published private(set) var gameAccessStates: [String: FFGameAccessState] = [:]
     @Published private(set) var busyIDs: Set<String> = []
+    @Published private(set) var isPatchAuthorizing = false
     @Published var isLoading = false
     @Published var notice: String?
     @Published var serverConfigurationError: String?
@@ -885,6 +1089,21 @@ final class FreeFireFeatureViewModel: ObservableObject {
         persistKeyAccessInfo()
     }
 
+    func authorizePatch() {
+        guard !isPatchAuthorizing else { return }
+        let game = selectedGame
+        isPatchAuthorizing = true
+        Task {
+            defer { isPatchAuthorizing = false }
+            do {
+                _ = try await FFPatchLicenseService.authorize(game: game)
+                notice = "Đã xác thực patch cho \(game.title)"
+            } catch {
+                notice = error.localizedDescription
+            }
+        }
+    }
+
     func setFeature(_ feature: FFRemoteFeature, enabled: Bool) {
         let game = selectedGame
         let operation = operationKey(featureID: feature.id, game: game)
@@ -936,16 +1155,53 @@ final class FreeFireFeatureViewModel: ObservableObject {
         )
         persistKeyAccessInfo()
 
-        _ = try await FFFeatureInstaller.install(
-            remoteURL: grant.downloadURL,
-            expectedSHA256: grant.downloadSHA256 ?? feature.activeSHA256,
-            game: game,
-            destinationPath: grant.destinationPath
-        )
+        let installMode = (grant.installMode ?? feature.installMode ?? "replace_restore").lowercased()
+        let recordDestination: String
+
+        if installMode == "multi_delete" {
+            let downloads = grant.files ?? []
+            guard downloads.count == 2 else {
+                throw FFFeatureError.serverMessage("Máy chủ chưa trả đủ 2 file cho AIM.")
+            }
+
+            var installedPaths: [String] = []
+            do {
+                for file in downloads {
+                    _ = try await FFFeatureInstaller.install(
+                        remoteURL: file.downloadURL,
+                        expectedSHA256: file.downloadSHA256,
+                        game: game,
+                        destinationPath: file.destinationPath,
+                        allowCreate: true
+                    )
+                    installedPaths.append(file.destinationPath)
+                }
+            } catch {
+                if !installedPaths.isEmpty {
+                    try? await FFFeatureInstaller.delete(game: game, relativePaths: installedPaths)
+                }
+                throw error
+            }
+
+            recordDestination = grant.destinationPath ?? feature.destinationPath
+        } else {
+            guard let downloadURL = grant.downloadURL,
+                  let destinationPath = grant.destinationPath else {
+                throw FFFeatureError.invalidResponse
+            }
+
+            _ = try await FFFeatureInstaller.install(
+                remoteURL: downloadURL,
+                expectedSHA256: grant.downloadSHA256 ?? feature.activeSHA256,
+                game: game,
+                destinationPath: destinationPath
+            )
+            recordDestination = destinationPath
+        }
 
         activeRecords.removeAll {
             $0.game == game &&
-            $0.destinationPath == grant.destinationPath &&
+            $0.destinationPath == recordDestination &&
             $0.featureID != feature.id
         }
         activeRecords.removeAll { $0.game == game && $0.featureID == feature.id }
@@ -953,8 +1209,8 @@ final class FreeFireFeatureViewModel: ObservableObject {
             game: game,
             featureID: feature.id,
             name: feature.name,
-            destinationPath: grant.destinationPath,
-            originalSHA256: feature.originalSHA256
+            destinationPath: recordDestination,
+            originalSHA256: installMode == "multi_delete" ? nil : feature.originalSHA256
         ))
         persistActiveRecords()
         notice = "Đã bật \(feature.name) thành công"
@@ -992,7 +1248,7 @@ final class FreeFireFeatureViewModel: ObservableObject {
             defer { busyIDs.remove(operation) }
             do {
                 try await performRestore(record: record, accessToken: token)
-                notice = "Đã khôi phục file gốc cho \(record.name)."
+                notice = "Đã tắt \(record.name) thành công"
             } catch {
                 notice = error.localizedDescription
             }
@@ -1001,12 +1257,31 @@ final class FreeFireFeatureViewModel: ObservableObject {
 
     private func performRestore(record: FFActiveRecord, accessToken: String) async throws {
         let grant = try await FFAccessClient.restore(record: record, accessToken: accessToken)
-        _ = try await FFFeatureInstaller.install(
-            remoteURL: grant.downloadURL,
-            expectedSHA256: grant.downloadSHA256 ?? record.originalSHA256,
-            game: record.game,
-            destinationPath: grant.destinationPath
-        )
+        guard grant.ok else { throw FFFeatureError.invalidResponse }
+
+        let restoreMode = (grant.restoreMode ?? "replace").lowercased()
+        if restoreMode == "delete" {
+            let paths = grant.deletePaths ?? []
+            guard !paths.isEmpty else {
+                throw FFFeatureError.invalidResponse
+            }
+            try await FFFeatureInstaller.delete(
+                game: record.game,
+                relativePaths: paths
+            )
+        } else {
+            guard let downloadURL = grant.downloadURL,
+                  let destinationPath = grant.destinationPath else {
+                throw FFFeatureError.invalidResponse
+            }
+            _ = try await FFFeatureInstaller.install(
+                remoteURL: downloadURL,
+                expectedSHA256: grant.downloadSHA256 ?? record.originalSHA256,
+                game: record.game,
+                destinationPath: destinationPath
+            )
+        }
+
         activeRecords.removeAll { $0.id == record.id }
         persistActiveRecords()
     }
@@ -1221,6 +1496,7 @@ struct FreeFireFeaturesView: View {
                     }
                     categorySelector
                     keyAccessCard
+                    patchAuthorizationButton
                     getKeyButton
                     featureHeader
                     mainContent
@@ -1304,7 +1580,7 @@ struct FreeFireFeaturesView: View {
 
     private func toastAccent(for text: String) -> Color {
         let lowered = text.lowercased()
-        if lowered.contains("đã bật") || lowered.contains("đã tắt") || lowered.contains("đã khôi phục") {
+        if lowered.contains("đã bật") || lowered.contains("đã tắt") || lowered.contains("đã khôi phục") || lowered.contains("đã xác thực patch") {
             return Color.green
         }
         return accent
@@ -1312,7 +1588,7 @@ struct FreeFireFeaturesView: View {
 
     private func toastIcon(for text: String) -> String {
         let lowered = text.lowercased()
-        if lowered.contains("đã bật") || lowered.contains("đã tắt") || lowered.contains("đã khôi phục") {
+        if lowered.contains("đã bật") || lowered.contains("đã tắt") || lowered.contains("đã khôi phục") || lowered.contains("đã xác thực patch") {
             return "checkmark.circle.fill"
         }
         return "exclamationmark.circle.fill"
@@ -1530,6 +1806,46 @@ struct FreeFireFeaturesView: View {
         .padding(14)
         .background(card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(cardBorder, lineWidth: 1))
+    }
+
+    private var patchAuthorizationButton: some View {
+        Button {
+            model.authorizePatch()
+        } label: {
+            HStack(spacing: 10) {
+                if model.isPatchAuthorizing {
+                    ProgressView()
+                        .tint(.black)
+                        .scaleEffect(0.82)
+                        .frame(width: 18, height: 18)
+                } else {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.system(size: 15, weight: .bold))
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.isPatchAuthorizing ? "ĐANG XÁC THỰC..." : "XÁC THỰC")
+                        .font(.system(size: 14, weight: .heavy, design: .rounded))
+                    Text("Tạo hama.lic từ ffrts_log.txt rồi xóa log")
+                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                        .opacity(0.68)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .bold))
+            }
+            .foregroundStyle(.black)
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity)
+            .frame(height: 54)
+            .background(accent, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .shadow(color: accent.opacity(0.18), radius: 12, y: 4)
+        }
+        .buttonStyle(.plain)
+        .disabled(model.isPatchAuthorizing)
+        .opacity(model.isPatchAuthorizing ? 0.78 : 1)
     }
 
     private var getKeyButton: some View {
